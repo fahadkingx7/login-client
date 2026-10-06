@@ -1,0 +1,66 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>LogIn</title><link rel="stylesheet" href="popup.css"><style id="veefivee-footer-visibility">.veefivee-footer{position:fixed!important;left:0!important;right:0!important;bottom:0!important;margin:0!important;padding:12px 20px 14px!important;z-index:99999!important;background:rgba(245,247,251,.97)!important;border-top:1px solid #e5e7ef!important;box-shadow:0 -6px 18px rgba(15,23,42,.05)!important;}</style></head><body>
+<section id="startup" class="screen hidden"><div class="startup-loader" role="status" aria-label="Loading"><span class="startup-text" id="startupText">Restoring secure session…</span></div></section>
+<section id="login" class="screen">
+  <div class="state-card login-card">
+    <div class="brand-mark">✓</div>
+    <span class="eyebrow">Secure access</span>
+    <h1>LogIn</h1>
+    <p>Sign in to access your shared login session.</p>
+
+    <div class="form-stack">
+      <div class="field">
+        <label for="email">Email</label>
+        <input id="email" type="email" autocomplete="username" placeholder="you@example.com">
+      </div>
+      <div class="field">
+        <label for="password">Password</label>
+        <input id="password" type="password" autocomplete="current-password" placeholder="••••••••">
+      </div>
+      <button id="loginBtn" class="btn btn-primary btn-block">Sign in</button>
+      <div id="loginError" class="alert alert-danger hidden"></div>
+
+
+    </div>
+  </div>
+</section>
+<section id="suspended" class="screen hidden"><div class="panel center"><div class="suspend-icon">!</div><div class="eyebrow red">Account status</div><h1 class="suspend-title">ACCOUNT SUSPENDED</h1><p>Your LogIn account is currently suspended.</p><button id="retrySuspended" class="btn light wide">Check again</button></div></section>
+<section id="deviceBlocked" class="screen hidden">
+  <div class="panel center">
+    <div class="warn-icon">!</div>
+    <div class="eyebrow red">Device access</div>
+    <h1>DEVICE NOT AUTHORIZED</h1>
+    <p>This account is already registered on another Chrome device.</p>
+    <div id="deviceBlockedReason" class="alert bad">Use Reset Device from your administrator before moving this account.</div>
+    <button id="deviceBlockedBack" class="btn light wide">Back to Sign in</button>
+  </div>
+</section>
+<section id="locked" class="screen hidden"><div class="panel center"><div class="suspend-icon">!</div><div class="eyebrow red">Security</div><h1 class="suspend-title">PROFILE LOCKED</h1><p id="lockedText">An unauthorized Chrome extension was detected.</p><button id="retryLocked" class="btn light wide">Check again</button></div></section>
+<section id="app" class="hidden">
+<div id="permissionAlert" class="alert info hidden" style="margin:0 9px 8px"><b>Website access needed.</b> Chrome permission is required to receive and apply managed-site cookies. <button id="grantAccess" class="btn light" style="margin-top:6px;width:100%">Grant access</button></div>
+<header class="topbar"><div class="brand"><div class="mini-logo">✓</div><div><strong>LogIn</strong><small>Share LogIn easily</small></div></div></header>
+
+<div class="card status-card"><div class="status-line"><div><span class="eyebrow">Account</span><h2 id="username">—</h2><span id="accountEmail" class="account-email">—</span><span id="website" class="ui-hook" aria-hidden="true">—</span></div><span id="authBadge" class="badge good"><span class="dot"></span>Active</span></div></div>
+
+<div class="card action-card"><div class="card-body"><button id="freshSync" class="btn primary wide">LogIn Website</button><div id="syncInfo" class="small hidden" aria-hidden="true"></div></div></div>
+
+      <div class="chrome-help">
+        <div class="chrome-help-title">Stuck on loading?</div>
+        <div class="chrome-help-text">Facing any issue? Refresh Chrome and try again.</div>
+        <button id="fixChrome" class="btn chrome-fix-btn" type="button">Fix Chrome</button>
+      </div>
+
+<div id="proxyCard" class="card"><div class="card-head"><div><span class="eyebrow">Network</span><h2>Proxy status</h2></div><span id="proxyBadge" class="badge warn">Checking</span></div><div class="card-body"><div class="kv"><span>Proxy IP</span><strong id="ip">—</strong></div><div class="kv"><span>Last sync</span><strong id="lastSync">Not synced</strong></div><div class="kv proxy-endpoint-row" aria-hidden="true"><span>Proxy</span><strong id="proxy">—</strong></div><div id="proxyInfo" class="alert info">Verifying the current proxy state…</div></div></div>
+
+<div class="card"><div class="card-body"><span class="eyebrow">Connected Websites</span><div id="sitesList" class="sites-list"></div></div></div>
+
+<div class="card signout-card"><div class="card-body"><button id="logout" class="btn danger wide">Sign out</button></div></div>
+
+<div id="error" class="alert bad hidden" style="margin:9px 10px"></div>
+<div class="footer">2026 LogIn <b>Beta Version</b>. All rights reserved</div>
+</section>
+<div id="toast" class="toast hidden"></div>
+<script src="shared/config.js"></script><script src="shared/util.js"></script><script src="shared/store.js"></script><script src="shared/firebase.js"></script><script src="shared/auth.js"></script><script src="shared/crypto.js"></script><script src="shared/cookies.js"></script><script src="shared/proxy.js"></script><script src="shared/rules.js"></script><script src="shared/security.js"></script><script src="shared/sync.js"></script><script src="popup.js"></script>
+<footer class="veefivee-footer" style="box-sizing:border-box;width:100%;margin:40px auto 0;padding:16px 20px 18px;text-align:center;font-family:Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;font-size:13px;font-weight:500;line-height:1.5;color:#6d4aff;letter-spacing:.1px;">Developed by 🌴<a href="https://veefivee.com" target="_blank" rel="noopener noreferrer" style="color:#6d4aff;text-decoration:none;font-weight:700;">VeeFivee</a></footer>
+
+<script src="modern-scrollbar.js"></script>
+</body></html>

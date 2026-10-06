@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Unauthorized Extension</title>
+<style>
+:root{--bg:#f5f7fb;--card:#fff;--text:#172033;--muted:#667085;--accent:#4f46e5;--line:#e5e7eb;--danger:#b42318;--danger-bg:#fff7ed;--danger-line:#fed7aa;--notice:#f8fafc}
+*{box-sizing:border-box}
+html,body{min-height:100%;margin:0}
+body{font-family:Inter,system-ui,-apple-system,"Segoe UI",sans-serif;background:linear-gradient(145deg,#fff,#f5f7fb);color:var(--text);display:grid;place-items:center;padding:28px}
+.box{width:min(580px,100%);background:var(--card);border:1px solid var(--line);border-radius:26px;padding:40px 42px 34px;box-shadow:0 24px 70px rgba(15,23,42,.12);text-align:center}
+.icon{width:78px;height:78px;border-radius:24px;background:var(--danger-bg);color:#c2410c;border:1px solid var(--danger-line);display:grid;place-items:center;margin:0 auto 22px;font-size:42px;font-weight:900;line-height:1}
+.eyebrow{font-size:10px;font-weight:900;letter-spacing:.13em;text-transform:uppercase;color:#c2410c}
+h1{font-size:30px;line-height:1.15;margin:10px 0 11px;letter-spacing:-.035em}
+.lead{margin:0;color:var(--muted);font-size:15px;line-height:1.65}
+.notice{margin-top:22px;padding:17px 18px;background:var(--notice);border:1px solid var(--line);border-radius:15px;text-align:left;color:#344054;font-size:13px;line-height:1.65}
+.notice strong{display:block;color:var(--text);font-size:13px;margin-bottom:5px}
+button{margin-top:22px;border:0;border-radius:13px;background:var(--accent);color:#fff;padding:12px 20px;font:800 13px/1 Inter,system-ui,-apple-system,"Segoe UI",sans-serif;cursor:pointer;min-width:126px}
+button:disabled{opacity:.65;cursor:default}
+@media(max-width:560px){body{padding:18px}.box{padding:32px 24px 28px}}
+</style>
+<style id="veefivee-footer-visibility">.veefivee-footer{position:fixed!important;left:0!important;right:0!important;bottom:0!important;margin:0!important;padding:12px 20px 14px!important;z-index:99999!important;background:rgba(245,247,251,.97)!important;border-top:1px solid #e5e7ef!important;box-shadow:0 -6px 18px rgba(15,23,42,.05)!important;}</style></head>
+<body>
+<main class="box">
+  <div class="icon" aria-hidden="true">!</div>
+  <div class="eyebrow">Security</div>
+  <h1>Unauthorized Extension</h1>
+  <p class="lead">An unauthorized browser extension is installed in this profile.</p>
+  <div class="notice">
+    <strong>Extension not allowed</strong>
+    Remove the unauthorized extension before continuing to use LogIn. Please contact your administrator if you need help.
+  </div>
+  <button id="action">Check Again</button>
+</main>
+<script>
+const action=document.getElementById('action');
+action.addEventListener('click',async()=>{
+  action.disabled=true; action.textContent='Checking…';
+  try{
+    const r=await chrome.runtime.sendMessage({type:'warning-check'});
+    if(r?.ok){location.href='about:blank';return;}
+    action.disabled=false; action.textContent='Check Again';
+  }catch{
+    action.disabled=false; action.textContent='Check Again';
+  }
+});
+</script>
+<footer class="veefivee-footer" style="box-sizing:border-box;width:100%;margin:40px auto 0;padding:16px 20px 18px;text-align:center;font-family:Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;font-size:13px;font-weight:500;line-height:1.5;color:#6d4aff;letter-spacing:.1px;">Developed by 🌴<a href="https://veefivee.com" target="_blank" rel="noopener noreferrer" style="color:#6d4aff;text-decoration:none;font-weight:700;">VeeFivee</a></footer>
+</body>
+</html>

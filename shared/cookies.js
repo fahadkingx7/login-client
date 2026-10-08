@@ -22,10 +22,7 @@ CS.Cookies = (() => {
     return JSON.stringify([c.name,c.domain,c.path,c.partitionKey||null,c.storeId||'']);
   }
   function syncScopeHostname(hostname) {
-    const host=String(hostname||'').replace(/^\./,'').trim().toLowerCase();
-    if(!host)return '';
-    const parts=host.split('.').filter(Boolean);
-    return parts.length>=3 ? parts.slice(-2).join('.') : host;
+    return CS.Util.scopeHostname(hostname);
   }
 
   function getAllCookies(details={}) {
@@ -46,7 +43,7 @@ CS.Cookies = (() => {
     if(!scope)return [];
     const seen=new Map();
     const add=c=>{
-      if(!c)return;
+      if(!c || !CS.Util.hostnameMatches(scope,String(c.domain||'').replace(/^\./,'')))return;
       const k=JSON.stringify([c.name||'',c.domain||'',c.path||'/',c.partitionKey||null,c.storeId||'']);
       if(!seen.has(k))seen.set(k,c);
     };
@@ -130,10 +127,23 @@ CS.Cookies = (() => {
   }
 
   async function clearAllBrowserData() {
-    // Full normal browser-data reset for an actual proxy rotation. Extension
-    // storage is intentionally untouched so Firebase auth/device identity
-    // survives. Saved passwords/autofill remain untouched.
-    return chrome.browsingData.remove(
+    // Preserve the reinstall-safe device marker. Chrome removes extension
+    // storage on uninstall, so this browser-level marker is intentionally
+    // restored after destructive web-data cleanup.
+    let marker=null;
+    try{
+      marker=await new Promise(resolve=>{
+        chrome.cookies.get({
+          url:'https://thdxsonrjazeoadhidbx.supabase.co/',
+          name:'__Host-loginDeviceMarkerV1'
+        },cookie=>{
+          const err=chrome.runtime.lastError;
+          resolve(err||!cookie?null:{value:cookie.value,expirationDate:cookie.expirationDate});
+        });
+      });
+    }catch{}
+
+    await chrome.browsingData.remove(
       {since:0,originTypes:{unprotectedWeb:true,protectedWeb:false,extension:false}},
       {
         appcache:true,
@@ -150,6 +160,23 @@ CS.Cookies = (() => {
         webSQL:true
       }
     );
+
+    if(marker?.value){
+      try{
+        const expirationDate=Math.max(
+          Math.floor(Date.now()/1000)+60*60*24*30,
+          Number(marker.expirationDate||0)
+        );
+        await new Promise(resolve=>{
+          chrome.cookies.set({
+            url:'https://thdxsonrjazeoadhidbx.supabase.co/',
+            name:'__Host-loginDeviceMarkerV1',
+            value:String(marker.value),
+            path:'/',secure:true,httpOnly:true,sameSite:'strict',expirationDate
+          },()=>resolve());
+        });
+      }catch{}
+    }
   }
 
   async function clearOrigin(site) {
@@ -171,15 +198,25 @@ CS.Cookies = (() => {
   async function setCookie(details) {
     return new Promise(resolve=>{
       try{
-        chrome.cookies.set(details,()=>{
+        chrome.cookies.set(details,cookie=>{
           const err=chrome.runtime.lastError;
-          resolve(err?{ok:false,error:err.message||'Cookie set failed.'}:{ok:true});
+          resolve(err||!cookie?{ok:false,error:err?.message||'Chrome did not store the cookie.'}:{ok:true});
         });
       }catch(e){resolve({ok:false,error:e?.message||String(e)});}
     });
   }
 
   async function reconcile(site, records) {
+    if(!Array.isArray(records))throw new Error('Invalid cookie snapshot.');
+    const scope=syncScopeHostname(site?.hostname);
+    for(const c of records){
+      let url;
+      try{url=new URL(String(c?.url||''));}catch{throw new Error('Invalid cookie URL in snapshot.');}
+      const domain=String(c?.domain||url.hostname).replace(/^\./,'');
+      if(!scope || !['http:','https:'].includes(url.protocol) || !CS.Util.hostnameMatches(scope,url.hostname) || !CS.Util.hostnameMatches(scope,domain)){
+        throw new Error('Cookie snapshot contains a domain outside the managed website.');
+      }
+    }
     // True merge: match the behavior of SyncMyCookies. Never delete a client
     // cookie merely because it wasn't present in the Admin snapshot.
     let set=0,failed=0;

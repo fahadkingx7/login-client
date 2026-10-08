@@ -1,6 +1,7 @@
 const $ = (id) => document.getElementById(id);
 let toastTimer = null;
 let startupHealthTimer = null;
+let popupGeneration = 0;
 let popupState = { session: null, profile: null, sites: [], device: null, proxy: null, health: null };
 
 function busy(button, on, label) {
@@ -17,10 +18,20 @@ function busy(button, on, label) {
 }
 
 function show(id) {
-  for (const name of ['startup', 'login', 'suspended', 'deviceBlocked', 'locked', 'app']) {
+  for (const name of ['startup', 'connectivity', 'login', 'suspended', 'deviceBlocked', 'locked', 'app']) {
     $(name).classList.toggle('hidden', name !== id);
   }
 }
+function isConnectivityError(message){
+  const m=String(message||'').toLowerCase();
+  return navigator.onLine===false || m.includes('could not reach supabase') || m.includes('supabase request timed out') || m.includes('network error') || m.includes('failed to fetch') || m.includes('check your internet connection') || m.includes('internet connection') || m.includes('proxy health request') || m.includes('proxy connection') || m.includes('proxy could not be restored') || m.includes('proxy is not working') || m.includes('could not connect');
+}
+function showConnectivity(){
+  const e=$('connectivityText');
+  if(e)e.textContent='Internet or proxy may not be working. Please check your connection or proxy and try again.';
+  show('connectivity');
+}
+
 
 function showError(message) {
   const box = $('loginError');
@@ -182,7 +193,7 @@ async function verifyCurrentProxy(authState, state) {
 async function updateDeviceIp(authState, state, health) {
   if (!state?.device || !health?.ok) return;
   // Public IP / proxy-health telemetry is local runtime state; do not write it
-  // to Firebase merely because the popup performed a health check.
+  // to Supabase merely because the popup performed a health check.
   popupState.device = {
     ...state.device,
     lastIp:health.ip || state.device.lastIp || '',
@@ -193,8 +204,9 @@ async function updateDeviceIp(authState, state, health) {
 }
 
 function render(state) {
-  const previousState=popupState||{};
-  popupState = state;
+  const previousState=state?.profile?.uid && state.profile.uid===popupState?.profile?.uid ? popupState : {};
+  popupState = state || {};
+  if (state?.deviceBlocked) return showDeviceBlocked(state.error);
   if (state?.suspended || state?.suspendedReason) return showSuspended();
   if (!state?.locked && state?.deviceResetRequired) {
     $('username').textContent = state.profile?.displayName || state.profile?.email || 'User';
@@ -225,6 +237,7 @@ function render(state) {
     $('proxyInfo').textContent = state.waitingForDevice
       ? 'This device was reset. Waiting for the new device registration to become active.'
       : 'Your Admin Extension has not assigned a managed website yet.';
+    $('sitesList').innerHTML = '';
     show('app');
     return;
   }
@@ -248,6 +261,16 @@ function render(state) {
   $('lastSync').textContent = deviceState?.lastSyncAt
     ? new Date(deviceState.lastSyncAt).toLocaleString()
     : (lastState?.lastSyncAt ? new Date(lastState.lastSyncAt).toLocaleString() : 'Not synced');
+  // A newer locally verified login sync wins over stale backend telemetry.
+  const displayedUid=String(state?.profile?.uid||state?.session?.uid||'');
+  CS.Store?.get?.(['clientVerifiedSyncAt','clientVerifiedSyncUid'])?.then(r=>{
+    if(!displayedUid || String(r.clientVerifiedSyncUid||'')!==displayedUid)return;
+    if(String(popupState?.profile?.uid||popupState?.session?.uid||'')!==displayedUid)return;
+    const verified=Date.parse(r.clientVerifiedSyncAt||'');
+    const remote=Date.parse(deviceState?.lastSyncAt||lastState?.lastSyncAt||'');
+    if(Number.isFinite(verified) && (!Number.isFinite(remote)||verified>remote))
+      $('lastSync').textContent=new Date(verified).toLocaleString();
+  }).catch(()=>{});
 
   const h = healthState;
   const configured = proxyState?.mode === 'fixed_servers';
@@ -255,16 +278,11 @@ function render(state) {
   // Preserve the last-known-good/optimistic connected state while verification
   // is in progress. Only an explicit confirmed failure should turn it red.
   const confirmedFailure = configured && h.pending !== true && h.ok === false && state.proxyFailed === true;
-  const working = configured && !confirmedFailure && (
-    h.ok === true ||
-    deviceState?.proxyHealthy === true ||
-    checking ||
-    (!h.ok && h.pending !== false && !state.proxyFailed)
-  );
-  $('proxyBadge').className = `badge ${working ? 'good' : 'bad'}`;
-  $('proxyBadge').innerHTML = `<span class="dot"></span>${working ? 'Connected' : 'Not Working'}`;
-  $('proxyInfo').className = `alert ${working ? 'info' : 'bad'}`;
-  $('proxyInfo').textContent = working
+  const working = configured && !confirmedFailure && (h.ok === true || deviceState?.proxyHealthy === true);
+  $('proxyBadge').className = `badge ${working ? 'good' : checking ? 'warn' : 'bad'}`;
+  $('proxyBadge').innerHTML = `<span class="dot"></span>${working ? 'Connected' : checking ? 'Checking' : 'Not Working'}`;
+  $('proxyInfo').className = `alert ${working || checking ? 'info' : 'bad'}`;
+  $('proxyInfo').textContent = working || checking
     ? (checking ? 'Verifying the proxy in the background…' : 'Proxy is active for this device.')
     : (h.reason || state.proxy?.lastError || state.error || 'Proxy is not configured or not working.');
   // syncInfo remains as a hidden compatibility hook; keep the dashboard visually quiet.
@@ -277,35 +295,128 @@ function render(state) {
 
 async function performBackgroundSync(forceProxyTest = false, freshSync = false) {
   const r = await send(freshSync ? 'fresh-sync' : 'refresh', {}, 18000);
-  if (!r.ok && !r.loggedIn && !r.suspended) return r;
+  if (!r.ok && !r.loggedIn && !r.suspended) { if(isConnectivityError(r?.error))showConnectivity(); return r; }
   render(r);
   return r;
 }
 
 function watchProxyRecovery(baseState){
+  const generation=popupGeneration;
+  let polling=false;
   clearInterval(startupHealthTimer);
   startupHealthTimer=setInterval(async()=>{
+    if(polling || generation!==popupGeneration)return;
+    polling=true;
     try{
       const r=await send('proxy-wait-status',{},4000);
+      if(generation!==popupGeneration)return;
       if(r?.status==='recovering'){
-        render({...baseState,health:r.health||{ok:false,pending:true,reason:'Reconnecting to proxy…'},proxyChecking:true,proxyFailed:false});
+        render({...baseState,health:r.health||{ok:false,pending:true,reason:'Verifying the proxy in the background…'},proxyChecking:true,proxyFailed:false});
         return;
       }
       if(r?.status==='failed'){
         clearInterval(startupHealthTimer);
-        render({...baseState,health:r.health||{ok:false,pending:false,reason:'Proxy could not be restored.'},proxyChecking:false,proxyFailed:true});
+        render({...baseState,health:r.health||{ok:false,pending:false,reason:'Proxy is not working.'},proxyChecking:false,proxyFailed:true});
+        return;
+      }
+      if(r?.status==='connected' && r?.health?.ok===true){
+        clearInterval(startupHealthTimer);
+        render({...baseState,health:{...r.health,pending:false},proxyChecking:false,proxyFailed:false});
         return;
       }
       clearInterval(startupHealthTimer);
-    }catch{}
+    }catch{}finally{polling=false;}
   },1500);
 }
 
+async function hydrateCachedClientView(generation=popupGeneration){
+  try{
+    const [session,profile,stored]=await Promise.all([
+      CS.Auth.session(false),
+      CS.Auth.cached(),
+      CS.Store.get([
+        'clientSitesCache',
+        'clientLastState',
+        'clientProxyHealth',
+        'lastSavedProxyConfig',
+        'activeProxyCredentials',
+        'clientDeviceCache',
+        'clientLockReason',
+        'clientSuspendedReason'
+      ])
+    ]);
+
+    if(generation!==popupGeneration || !session || !profile || profile.role!=='client') return false;
+    if(stored.clientSuspendedReason || profile.active===false){
+      // This is only a local snapshot. An Admin may have unsuspended the
+      // account since it was cached. Confirm live status before showing a
+      // suspension warning (or requesting any destructive enforcement).
+      showStartup('Checking account status…');
+      return false;
+    }
+
+    // A cached lock is not displayed immediately because it may be stale.
+    // Keep the old startup loader visible while the foreground security/control
+    // reconciliation confirms whether the profile is actually still locked.
+    if (String(stored.clientLockReason || '').trim()) {
+      showStartup('Restoring secure session…');
+      return false;
+    }
+
+    const proxyRaw=stored.lastSavedProxyConfig || stored.activeProxyCredentials || null;
+    const proxy=proxyRaw && proxyRaw.host && Number(proxyRaw.port)
+      ? {...proxyRaw,mode:'fixed_servers'}
+      : {mode:'unconfigured',healthy:false,ip:'',lastError:'Proxy is not configured.'};
+    const previousHealth=stored.clientProxyHealth || {};
+    const previousLastState=stored.clientLastState || {};
+    const previousDevice=stored.clientDeviceCache || {};
+    const hasKnownGood=previousHealth.ok===true || previousDevice.proxyHealthy===true || previousLastState.proxyHealthy===true;
+    const hasKnownFailure=previousHealth.ok===false && previousHealth.pending===false;
+
+    // Show the cached client dashboard immediately. Proxy verification continues
+    // in the background and will replace this optimistic state with the real
+    // result once Chrome has finished checking the proxy.
+    render({
+      ok:true,
+      loggedIn:true,
+      session,
+      profile,
+      sites:Array.isArray(stored.clientSitesCache)?stored.clientSitesCache:[],
+      proxy,
+      device:previousDevice,
+      lastState:previousLastState,
+      health:{...previousHealth,pending:hasKnownFailure?false:true},
+      proxyChecking:proxy.mode==='fixed_servers',
+      proxyFailed:hasKnownFailure,
+      locked:!!stored.clientLockReason,
+      suspended:false,
+      cachedView:true
+    });
+    return true;
+  }catch{
+    return false;
+  }
+}
+
 async function startup() {
+  const generation=++popupGeneration;
   clearError();
-  showStartup('Restoring secure session…');
+  clearInterval(startupHealthTimer);
+  if(navigator.onLine===false)return showConnectivity();
+
+  // Popup open is an explicit foreground reconciliation point. Run the same
+  // control-plane checks normally driven by alarms without waiting for the
+  // next background tick. This stays fire-and-forget so the dashboard can
+  // still paint immediately from cached state.
+  send('popup-open',{},20000).catch(()=>{});
+
+  // Never block the popup on network/Supabase/proxy verification. Paint the
+  // last known client state immediately, then reconcile everything in the
+  // background. This restores the normal fast popup experience.
+  const cachedShown=await hydrateCachedClientView(generation);
+  if(generation!==popupGeneration)return;
   const watchdog=setTimeout(()=>{
-    if(!$('startup').classList.contains('hidden')){
+    if(generation===popupGeneration && !cachedShown && !$('startup').classList.contains('hidden')){
       show('login');
       showError('Startup is taking too long. Please reload the extension.');
     }
@@ -313,32 +424,80 @@ async function startup() {
 
   try{
     const local=await restoreAuth();
-    if(!local){clearTimeout(watchdog);show('login');return;}
-    if(local.suspended){clearTimeout(watchdog);showSuspended();return;}
+    if(generation!==popupGeneration){clearTimeout(watchdog);return;}
+    if(!local){
+      clearTimeout(watchdog);
+      popupState={};
+      show('login');
+      return;
+    }
+    if(local.suspended){clearTimeout(watchdog);showSuspended();send('activate-suspension',{reason:'Account suspended.'},12000).catch(()=>{});return;}
 
-    showStartup('Checking your authorized device…');
+    // Resume is deliberately proxy-test-free. clientStep still applies the
+    // configured proxy immediately, while check-proxy below performs the actual
+    // health verification in the background.
     const state=await send('resume',{allowDeviceReset:true},20000);
     clearTimeout(watchdog);
+    if(generation!==popupGeneration)return;
 
     if(state?.deviceBlocked)return showDeviceBlocked(state.error);
-    if(state?.suspended)return showSuspended();
+    if(state?.suspended){showSuspended();send('activate-suspension',{reason:'Account suspended.'},12000).catch(()=>{});return;}
     if(state?.locked)return render(state);
-    if(!(state?.profile&&state?.loggedIn))throw new Error(state?.error||'This device could not be authorized.');
+    if(!(state?.profile&&state?.loggedIn)){
+      if(!cachedShown)throw new Error(state?.error||'This device could not be authorized.');
+      return;
+    }
 
-    render(state);
+    // Keep the dashboard visible with the latest account/site state while the
+    // proxy test runs separately.
+    render({...state,proxyChecking:state?.proxy?.mode==='fixed_servers' ? true : false,proxyFailed:false});
 
     if(state?.proxy?.mode==='fixed_servers'||state?.proxyChecking){
-      const health=await send('check-proxy',{},20000);
-      if(health?.deviceBlocked)return showDeviceBlocked(health.error);
-      if(health?.suspended)return showSuspended();
-      if(health?.profile&&health?.loggedIn)render(health);
-      else render({...state,...health,proxyFailed:health?.proxyFailed===true,health:health?.health||{ok:false,reason:health?.error||'Proxy is not working.'}});
-      if(health?.proxyChecking===true || health?.health?.pending===true)watchProxyRecovery({...state,...health,proxy:health.proxy||state.proxy,profile:health.profile||state.profile,sites:health.sites||state.sites,device:health.device||state.device});
+      const baseState=state;
+      // Do not await this from the UI startup path: the popup must remain open
+      // and usable while Chrome verifies the proxy.
+      send('check-proxy',{},20000).then((health)=>{
+        if(generation!==popupGeneration)return;
+        if(health?.deviceBlocked)return showDeviceBlocked(health.error);
+        if(health?.suspended){showSuspended();send('activate-suspension',{reason:'Account suspended.'},12000).catch(()=>{});return;}
+        if(!health) return;
+
+        const merged=health?.profile&&health?.loggedIn
+          ? health
+          : {...baseState,...health,proxyFailed:health?.proxyFailed===true,health:health?.health||{ok:false,reason:health?.error||'Proxy is not working.'}};
+
+        // A temporary failure enters background recovery. Only a confirmed
+        // failure turns the dashboard red; the managed tab remains normal Chrome
+        // navigation through the proxy throughout.
+        if(health?.proxyChecking===true || health?.health?.pending===true){
+          render({...merged,proxyChecking:true,proxyFailed:false,health:health?.health||{ok:false,pending:true,reason:'Verifying the proxy in the background…'}});
+          watchProxyRecovery({...baseState,...health,proxy:health.proxy||baseState.proxy,profile:health.profile||baseState.profile,sites:health.sites||baseState.sites,device:health.device||baseState.device});
+        }else if(health?.proxyFailed===true || (health?.health?.ok===false && health?.health?.pending!==true)){
+          render({...merged,proxyChecking:false,proxyFailed:true,health:health?.health||{ok:false,pending:false,reason:health?.error||'Proxy is not working.'}});
+        }else{
+          render({...merged,proxyChecking:false,proxyFailed:false});
+        }
+      }).catch(()=>{});
     }
   }catch(error){
     clearTimeout(watchdog);
-    show('login');
-    showError(error?.message||String(error));
+    if(generation!==popupGeneration)return;
+    const message=String(error?.message||error||'');
+    const proxyError=/proxy|tunnel|err_(proxy|tunnel|connection_timed_out|connection_refused)/i.test(message);
+    if(proxyError && cachedShown){
+      render({
+        ...(popupState||{}),
+        proxyChecking:false,
+        proxyFailed:true,
+        health:{ok:false,pending:false,reason:message||'Proxy is not working.'}
+      });
+      return;
+    }
+    if(isConnectivityError(message))return showConnectivity();
+    if(!cachedShown){
+      show('login');
+      showError(message||'Startup failed. Please try again.');
+    }
   }
 }
 
@@ -365,46 +524,60 @@ $('fixChrome').onclick = async () => {
 };
 
 $('loginBtn').onclick=async()=>{
+  const generation=++popupGeneration;
+  clearInterval(startupHealthTimer);
   clearError();
   const email=$('email').value.trim(),password=$('password').value;
   if(!email||!password){showError('Enter email and password.');return;}
   const b=$('loginBtn');busy(b,true,'Signing in…');
   try{
-    const result=await send('login',{email,password},20000);
+    const result=await send('login',{email,password},90000);
+    if(generation!==popupGeneration)return;
     if(result?.deviceBlocked)return showDeviceBlocked(result.error);
     if(result?.suspended)return showSuspended();
     if(result?.profile&&result?.loggedIn){
       render(result);
       if(result?.proxy?.mode==='fixed_servers'||result?.proxyChecking){
-        const health=await send('check-proxy',{},20000);
-        if(health?.deviceBlocked)return showDeviceBlocked(health.error);
-        if(health?.suspended)return showSuspended();
-        if(health?.profile&&health?.loggedIn)render(health);
-        else render({...result,...health,proxyFailed:health?.proxyFailed===true,health:health?.health||{ok:false,reason:health?.error||'Proxy is not working.'}});
-        if(health?.proxyChecking===true || health?.health?.pending===true)watchProxyRecovery({...result,...health,proxy:health.proxy||result.proxy,profile:health.profile||result.profile,sites:health.sites||result.sites,device:health.device||result.device});
+        send('check-proxy',{},20000).then((health)=>{
+        if(generation!==popupGeneration)return;
+          if(health?.deviceBlocked)return showDeviceBlocked(health.error);
+          if(health?.suspended)return showSuspended();
+          if(!health)return;
+          const merged=health?.profile&&health?.loggedIn
+            ? health
+            : {...result,...health,proxyFailed:health?.proxyFailed===true,health:health?.health||{ok:false,reason:health?.error||'Proxy is not working.'}};
+          if(health?.proxyChecking===true || health?.health?.pending===true){
+            render({...merged,proxyChecking:true,proxyFailed:false,health:health?.health||{ok:false,pending:true,reason:'Verifying the proxy in the background…'}});
+            watchProxyRecovery({...result,...health,proxy:health.proxy||result.proxy,profile:health.profile||result.profile,sites:health.sites||result.sites,device:health.device||result.device});
+          }else if(health?.proxyFailed===true || (health?.health?.ok===false && health?.health?.pending!==true)){
+            render({...merged,proxyChecking:false,proxyFailed:true});
+          }else{
+            render({...merged,proxyChecking:false,proxyFailed:false});
+          }
+        }).catch(()=>{});
       }
       if(Number(result?.applied||0)>0){
         toast(`Login completed • ${result.applied} site${Number(result.applied)===1?'':'s'} synced.`);
-      }else{
-        const d=(result?.syncDiagnostics||[]).find(x=>x?.status && x.status!=='missing');
-        if(d?.status==='invalid-snapshot') toast('Login succeeded, but the latest cookie snapshot could not be restored.');
-        else if(d?.status==='site-id-mismatch') toast('Login succeeded, but the cookie snapshot did not match the assigned site.');
       }
       return;
     }
+    if(isConnectivityError(result?.error)||result?.proxyFailed===true)return showConnectivity();
     show('login');showError(result?.error||'Sign in failed.');
   }catch(error){
+    if(isConnectivityError(error?.message))return showConnectivity();
     show('login');showError(error?.message||String(error));
   }finally{busy(b,false,'Sign in');}
 };
 
 $('freshSync').onclick = async () => {
+  const generation=popupGeneration;
   const b = $('freshSync');
   let completed = false;
   busy(b, true, 'Logging In…');
   try {
     const r = await send('fresh-sync', {}, 20000);
-    render(r);
+    if(generation!==popupGeneration)return;
+    if(r?.profile || r?.suspended || r?.locked || r?.deviceBlocked)render(r);
     if (r?.ok) {
       completed = true;
       b.disabled = true;
@@ -424,6 +597,7 @@ $('freshSync').onclick = async () => {
       }
       return;
     }
+    if(isConnectivityError(r?.error)||r?.proxyFailed===true)return showConnectivity();
     toast(r?.error || 'Login failed.');
   } finally {
     if (!completed) busy(b, false, 'LogIn Website');
@@ -431,12 +605,24 @@ $('freshSync').onclick = async () => {
 };
 
 $('logout').onclick = async () => {
+  ++popupGeneration;
+  clearInterval(startupHealthTimer);
+  popupState={};
   const b = $('logout');
   busy(b, true, 'Signing out…');
-  await send('logout', {}, 10000);
+  const result=await send('logout', {}, 30000);
+  // If the background response is interrupted, still prevent any cached
+  // extension session from reappearing on the next browser launch.
+  await CS.Store.set({clientSignedOut:true}).catch(()=>{});
   await CS.Auth.logout().catch(() => {});
+  $('password').value='';
+  $('freshSync').classList.remove('login-success');
+  $('freshSync').disabled=false;
+  $('freshSync').textContent='LogIn Website';
+  delete $('freshSync').dataset.oldLabel;
   show('login');
   busy(b, false, '↪');
+  if(result?.ok!==true)showError(result?.error||'Signed out, but browser cleanup was interrupted. Please retry.');
 };
 
 $('retrySuspended').onclick = () => startup();
@@ -469,7 +655,27 @@ function toast(message) {
   toastTimer = setTimeout(() => el.classList.add('hidden'), 2400);
 }
 
-// Always show a usable login screen if JavaScript starts successfully but Firebase
+
+$('checkAgainConnectivity')?.addEventListener('click',async()=>{
+  const b=$('checkAgainConnectivity');
+  if(!b || b.disabled)return;
+  const started=performance.now();
+  b.classList.add('connectivity-checking');
+  b.setAttribute('aria-busy','true');
+  busy(b,true,'Checking…');
+  try{if(typeof startup==='function')await startup();else window.location.reload();}catch(e){showConnectivity();}
+  finally{
+    const wait=Math.max(0,450-(performance.now()-started));
+    if(wait)await new Promise(r=>setTimeout(r,wait));
+    if(b){
+      busy(b,false,'Check again');
+      b.classList.remove('connectivity-checking');
+      b.removeAttribute('aria-busy');
+    }
+  }
+});
+window.addEventListener('offline',()=>showConnectivity());
+// Always show a usable login screen if JavaScript starts successfully but Supabase
 // or the background worker is unavailable. This avoids a blank white popup.
 show('login');
 startup();

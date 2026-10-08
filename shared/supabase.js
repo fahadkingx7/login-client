@@ -1,11 +1,11 @@
 globalThis.CS = globalThis.CS || {};
 CS.Firebase = (() => {
   /*
-   * Firebase-compatible facade backed by Supabase.
+   * Compatibility facade backed by Supabase.
    *
-   * The rest of the extension intentionally keeps its existing CS.Firebase
-   * API so the cookie/device/proxy/sync logic does not need a risky rewrite.
-   * Firestore's old nested paths are translated to the normalized Postgres
+   * The rest of the extension intentionally keeps its existing internal API so the
+   * cookie/device/proxy/sync logic does not need a risky rewrite. The old nested
+   * paths are translated to the normalized Postgres
    * tables created for LogIn v4.
    */
   const cfg = CS.CONFIG;
@@ -18,14 +18,18 @@ CS.Firebase = (() => {
   async function request(url, options = {}) {
     const controller = new AbortController();
     const timeoutMs = Number(options.timeoutMs || 15000);
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; controller.abort(); }, timeoutMs);
+    const onAbort = () => controller.abort(options.signal?.reason);
+    if (options.signal?.aborted) onAbort();
+    else options.signal?.addEventListener('abort', onAbort, { once: true });
     const headers = { ...(options.headers || {}) };
     if (!headers.apikey) headers.apikey = cfg.supabasePublishableKey;
     const fetchOptions = {
       cache: 'no-store',
       ...options,
       headers,
-      signal: options.signal || controller.signal
+      signal: controller.signal
     };
     delete fetchOptions.timeoutMs;
     try {
@@ -48,7 +52,7 @@ CS.Firebase = (() => {
       }
       return data;
     } catch (e) {
-      if (e?.name === 'AbortError') {
+      if (e?.name === 'AbortError' && timedOut) {
         const x = new Error('Supabase request timed out. Check your Internet connection and try again.');
         x.code = 'NETWORK_TIMEOUT';
         throw x;
@@ -61,6 +65,7 @@ CS.Firebase = (() => {
       throw e;
     } finally {
       clearTimeout(timer);
+      options.signal?.removeEventListener('abort', onAbort);
     }
   }
 
@@ -433,11 +438,22 @@ CS.Firebase = (() => {
     const params = new URLSearchParams();
     params.set('select', '*');
     for (const [k, v] of Object.entries(filters || {})) params.set(k, `eq.${v}`);
-    if (order) params.set('order', order);
-    const rows = await request(`${rest}/${table}?${params}`, {
-      headers: authHeaders(token)
-    });
-    return Array.isArray(rows) ? rows : [];
+    // PostgREST caps responses (normally at 1,000 rows); page through the
+    // complete collection so larger accounts do not silently lose clients/sites.
+    const identity = table === 'client_site_access' ? 'site_id' : 'id';
+    params.set('order', order ? `${order},${identity}.asc` : `${identity}.asc`);
+    const pageSize = 500;
+    const all = [];
+    for (let offset = 0; ; offset += pageSize) {
+      params.set('limit', String(pageSize));
+      params.set('offset', String(offset));
+      const rows = await request(`${rest}/${table}?${params}`, {
+        headers: authHeaders(token)
+      });
+      if (!Array.isArray(rows)) return all;
+      all.push(...rows);
+      if (rows.length < pageSize) return all;
+    }
   }
 
   async function insertOne(table, row, token) {
@@ -482,6 +498,19 @@ CS.Firebase = (() => {
       method: 'DELETE',
       headers: authHeaders(token, { Prefer: 'return=minimal' })
     });
+  }
+
+  // Lightweight presence update used by the client heartbeat. The deviceId is
+  // included in the filter so an old/reset device cannot update a newer
+  // device's presence row. Only last_seen_at is changed.
+  async function touchDevicePresence(uid, deviceId, token, lastSeenAt) {
+    const rows = await updateRows('devices', {
+      user_id: String(uid || ''),
+      device_id: String(deviceId || '')
+    }, {
+      last_seen_at: lastSeenAt || new Date().toISOString()
+    }, token);
+    return Array.isArray(rows) ? rows[0] || null : null;
   }
 
   function wrap(exists, data) {
@@ -787,8 +816,23 @@ CS.Firebase = (() => {
 
     if (path[0] === 'deviceClaims') {
       const row = rowClaim(data, path[1]);
-      const result = await insertOne('device_claims', row, token);
-      return wrap(true, camelClaim(result?.[0] || row));
+      try {
+        const result = await insertOne('device_claims', row, token);
+        return wrap(true, camelClaim(result?.[0] || row));
+      } catch (e) {
+        // Some deployed Supabase databases enforce a UNIQUE constraint on
+        // device_claims.device_id. When this Chrome installation is already
+        // claimed by another account, surface the intended device-claim error
+        // instead of leaking the raw Postgres constraint message into the UI.
+        const raw = String(e?.message || e || '');
+        const code = String(e?.code || '');
+        if (code === '23505' || /device_claims_device_id_idx|duplicate key value violates unique constraint/i.test(raw)) {
+          const x = new Error('This Chrome device is already registered to another account. Use Reset Device on the existing account before moving it.');
+          x.code = 'DEVICE_ALREADY_CLAIMED';
+          throw x;
+        }
+        throw e;
+      }
     }
 
     throw new Error(`Unsupported create path: ${path.join('/')}`);
@@ -840,6 +884,7 @@ CS.Firebase = (() => {
     setDoc,
     deleteDoc,
     commitDocs,
+    touchDevicePresence,
     listDocs,
     queryDocsByField,
     parseFields: x => x || {},

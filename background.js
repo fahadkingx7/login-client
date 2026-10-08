@@ -1,25 +1,169 @@
 /* Cookie Sync Client v9.2 reset-safe device authorization + proxy recovery */
-importScripts('shared/config.js','shared/util.js','shared/store.js','shared/firebase.js','shared/auth.js','shared/crypto.js','shared/cookies.js','shared/proxy.js','shared/rules.js','shared/security.js','shared/sync.js');
+importScripts('shared/config.js','shared/public-suffix.js','shared/util.js','shared/recovery.js','shared/store.js','shared/supabase.js','shared/auth.js','shared/crypto.js','shared/cookies.js','shared/proxy.js','shared/rules.js','shared/security.js','shared/sync.js');
 
 CS.Proxy.installAuthListener();
 
 let runningPromise=null;
+let clientLoginInProgress=false;
 let proxyRecoveryPromise=null;
+// One global queue for destructive/sync browser operations. This prevents
+// Fix Chrome, remote refresh, Fresh Sync, Share Login sync, and the regular
+// client lifecycle from clearing or restoring cookies at the same time.
+let browserOperationPromise=Promise.resolve();
+async function withBrowserOperation(fn){
+  const previous=browserOperationPromise;
+  let release;
+  browserOperationPromise=new Promise(resolve=>{release=resolve;});
+  await previous.catch(()=>{});
+  try{
+    return await fn();
+  }finally{
+    release();
+  }
+}
 const PROXY_HEALTH_ALARM='cookie-sync-proxy-health';
 const PROXY_ROTATION_CLEANUP_ALARM='cookie-sync-proxy-rotation-cleanup';
 const MANUAL_SHARE_OPEN_ALARM='cookie-sync-manual-share-open';
+const PRESENCE_HEARTBEAT_ALARM='cookie-sync-presence-heartbeat';
+const STATE_RECONCILIATION_ALARM='cookie-sync-state-reconciliation';
+const SUSPENSION_CHECK_ALARM='cookie-sync-suspension-check';
+const CONTROL_PLANE_ALARM='cookie-sync-control-plane';
 const PROXY_RECOVERY_MAX_ATTEMPTS=4;
 const PROXY_RECOVERY_DELAYS=[0,1200,3000,5000];
+// Reuse a very recent successful proxy check so startup/popup can release the
+// managed site immediately. A real proxy error still locks and recovers at once.
+const PROXY_HEALTH_CACHE_MAX_AGE_MS=75000;
+const PROXY_HEALTH_TIMEOUT_MS=8000;
+const MANUAL_SHARE_OPEN_MAX_AGE_MS=5*60*1000;
 async function ensureManualShareOpenAlarm(){
   if(!chrome.alarms?.create)return;
-  try{await chrome.alarms.create(MANUAL_SHARE_OPEN_ALARM,{delayInMinutes:0.5,periodInMinutes:0.5});}catch{}
+  try{await chrome.alarms.create(MANUAL_SHARE_OPEN_ALARM,{delayInMinutes:0.5,periodInMinutes:1});}catch{}
 }
 
-async function checkManualShareOpen(){
+async function ensurePresenceHeartbeatAlarm(){
+  if(!chrome.alarms?.create)return;
+  try{await chrome.alarms.create(PRESENCE_HEARTBEAT_ALARM,{delayInMinutes:1,periodInMinutes:1});}catch{}
+}
+
+async function ensureControlPlaneAlarm(){
+  if(!chrome.alarms?.create)return;
+  try{
+    // Alarms can disappear across browser restarts/extension reloads. Restore
+    // the poll when a worker wakes, but never postpone an existing due poll.
+    const current=await chrome.alarms.get?.(CONTROL_PLANE_ALARM);
+    if(current && Number(current.periodInMinutes)===1)return;
+    await chrome.alarms.create(CONTROL_PLANE_ALARM,{delayInMinutes:0.5,periodInMinutes:1});
+  }catch{}
+}
+
+let presenceWriteInFlight=null;
+async function sendPresenceHeartbeat(force=false){
+  if(presenceWriteInFlight)return presenceWriteInFlight;
+  presenceWriteInFlight=(async()=>{
+    try{
+      const s=await CS.Auth.session(true).catch(()=>null);
+      const p=await CS.Auth.cached().catch(()=>null);
+      if(!s?.uid||!s?.idToken||!p||p.role!=='client'||p.active===false)return false;
+
+      const now=Date.now();
+      const local=await CS.Store.get(['clientPresenceLastSentAt','clientDeviceCache','clientDeviceCacheUid']).catch(()=>({}));
+      if(!force && now-Number(local.clientPresenceLastSentAt||0)<45000)return false;
+
+      const identity=await CS.Crypto.deviceIdentityForAccount(String(s.uid));
+      const device=local.clientDeviceCacheUid===String(s.uid)?local.clientDeviceCache:null;
+      if(!device || String(device.deviceId||'')!==String(identity.deviceId||''))return false;
+      if(String(device.status||'')==='revoked')return false;
+
+      const stamp=new Date(now).toISOString();
+      const updated=await CS.Firebase.touchDevicePresence(s.uid,identity.deviceId,s.idToken,stamp).catch(()=>null);
+      if(!updated)return false;
+
+      await CS.Store.set({
+        clientPresenceLastSentAt:now,
+        clientDeviceCache:{...device,lastSeenAt:stamp}
+      }).catch(()=>{});
+      return true;
+    }catch{return false}
+    finally{presenceWriteInFlight=null;}
+  })();
+  return presenceWriteInFlight;
+}
+
+
+async function processHiddenProxyRotationSignal(me,sites,signalVersion){
+  const uid=String(me?.session?.uid||'');
+  const subadmin=String(me?.profile?.subadminUid||'');
+  if(!uid||!subadmin||!Array.isArray(sites)||!sites.length||!Number(signalVersion||0))return{ok:false,reason:'missing-signal-context'};
+
+  // Hidden clients already have a valid device claim. A proxy-rotation signal
+  // must never enter the normal authorization/reclaim path: doing so can race
+  // with Admin -> Reset Device and immediately recreate a freshly-reset claim.
+  const binding=await getDeviceBinding().catch(()=>null);
+  if(String(binding?.uid||'')!==uid||!String(binding?.deviceId||''))return{ok:false,reason:'no-device-binding'};
+
+  const control=await getControl(me);
+  const controlReset=Math.max(Number(control?.state?.resetVersion||0),Number(me?.profile?.deviceResetVersion||0));
+  const bindingReset=Number(binding?.resetVersion||0);
+
+  // A real Admin reset always wins over a hidden proxy-rotation signal. Stop
+  // here and let the normal client startup/reauthorization path handle it.
+  if(controlReset>bindingReset)return{ok:false,resetPending:true};
+
+  const claim=await CS.Firebase.getDoc(['deviceClaims',uid],me.session.idToken).catch(()=>({exists:false,data:null}));
+  const deviceDoc=await CS.Firebase.getDoc(['devices',uid],me.session.idToken).catch(()=>({exists:false,data:null}));
+  const deviceId=String(binding.deviceId||'');
+  if(!claim.exists||!deviceDoc.exists||String(claim.data?.deviceId||'')!==deviceId||String(deviceDoc.data?.deviceId||'')!==deviceId||String(deviceDoc.data?.status||'')==='revoked'){
+    return{ok:false,resetPending:true};
+  }
+
+  const proxy=CS.Proxy.normalize(control.proxy||{mode:'unconfigured'});
+  if(proxy.mode!=='fixed_servers')return{ok:false,proxyFailed:true,reason:'Proxy is not configured.'};
+
+  try{
+    await CS.Proxy.setActiveCredentials(proxy);
+    await CS.Proxy.apply(proxy);
+    await CS.Rules.applyNavigationPolicy(sites,{locked:false,testEnabled:true});
+    const health=await CS.Proxy.test(proxy,{timeoutMs:PROXY_HEALTH_TIMEOUT_MS});
+    if(!health.ok){
+      await beginProxyRecovery(health.reason||'Proxy is not working.').catch(()=>{});
+      return{ok:false,proxyFailed:true,health};
+    }
+
+    // Re-check reset state after proxy application/health verification. This
+    // closes the race where Admin reset happens while the proxy test is running.
+    const freshMe=await CS.Auth.currentProfile(true).catch(()=>null);
+    if(!freshMe?.session?.uid||String(freshMe.session.uid)!==uid)return{ok:false,resetPending:true};
+    const freshControl=await getControl(freshMe);
+    const freshReset=Math.max(Number(freshControl?.state?.resetVersion||0),Number(freshMe?.profile?.deviceResetVersion||0));
+    if(freshReset>bindingReset)return{ok:false,resetPending:true};
+
+    const cleanup=await cleanupAfterProxyRotation(subadmin,Number(signalVersion||control.state.proxyVersion||0),{existingDeviceOnly:true});
+    if(!cleanup.ok)return{ok:false,proxyCleanupPending:true,reason:cleanup.reason||'Browser refresh is pending.'};
+
+    await CS.Rules.applyNavigationPolicy(sites,{locked:false,testEnabled:false}).catch(()=>{});
+    await CS.Store.set({
+      clientProxyHealth:{...health,pending:false,checkedAt:Date.now()},
+      lastProxyHealthProxyIdentity:clientProxyIdentity(proxy),
+      lastSavedProxyConfig:proxy,
+      lastSavedProxyConfigAt:Date.now(),
+      lastSavedProxySubadminUid:subadmin,
+      clientAppliedProxyVersion:Number(signalVersion||control.state.proxyVersion||0),
+      clientAppliedProxySubadminUid:subadmin,
+      clientAppliedProxyIdentity:clientProxyIdentity(proxy)
+    }).catch(()=>{});
+    return{ok:true,health};
+  }catch(e){
+    const message=String(e?.message||e||'Hidden proxy rotation failed.');
+    if(e?.code==='DEVICE_RESET_PENDING')return{ok:false,resetPending:true};
+    return{ok:false,reason:message};
+  }
+}
+
+async function checkManualShareOpen({forceSites=false}={}){
   try{
     const me=await CS.Auth.currentProfile(false).catch(()=>null);
     if(!me?.session?.idToken)return;
-    const sites=await loadSites(me,{force:false});
+    const sites=await loadSites(me,{force:forceSites===true});
     if(!Array.isArray(sites)||!sites.length)return;
     const local=await CS.Store.get([
       'lastAdminBrowserRefreshAt',
@@ -27,6 +171,10 @@ async function checkManualShareOpen(){
       'lastTargetedBrowserRefreshAt',
       'lastTargetedBrowserRefreshUid',
       'manualShareOpenedVersions',
+      'lastProxyRotationSignalVersion',
+      'lastProxyRotationSignalSubadminUid',
+      'clientAppliedProxyVersion',
+      'clientAppliedProxySubadminUid',
       'clientLoginSessionStartedAt'
     ]).catch(()=>({}));
     const localSub=String(local.lastAdminBrowserRefreshSubadminUid||'');
@@ -39,6 +187,7 @@ async function checkManualShareOpen(){
     // Historical requests must never replay during login or a later worker wake.
     if(!sessionStartedAt){
       await CS.Store.set({clientLoginSessionStartedAt:Date.now()}).catch(()=>{});
+      await CS.Store.remove(['clientVerifiedSyncAt','clientVerifiedSyncUid']).catch(()=>{});
     }
     const activeSessionStartedAt=sessionStartedAt||Date.now();
     // Do not replay an Admin refresh signal that predates this client account.
@@ -56,6 +205,40 @@ async function checkManualShareOpen(){
       if(!r.exists||!r.data)continue;
       const snap=r.data;
       const reason=String(snap.reason||'');
+
+      // Main Admin-created hidden clients are intentionally absent from the
+      // Sub-admin client list. A proxy rotation still has to reach them.
+      // Admin publishes this durable signal into the same managed-site snapshot
+      // that hidden clients already read. Treat it as a fallback transport for
+      // proxy rotation; the normal control-plane version check remains the
+      // authoritative path.
+      if(reason.startsWith('admin-proxy-rotation:')){
+        const signalVersion=Number(reason.slice('admin-proxy-rotation:'.length).trim()||snap.requiredProxyVersion||0);
+        // The rotation signal is durable in the shared snapshot, so its local
+        // acknowledgement must survive client logout/login. Use the proxy version
+        // already installed on this browser as an additional acknowledgement source;
+        // otherwise logout clears the signal marker and the exact same old rotation
+        // would be replayed on every subsequent login.
+        const signalSeenVersion=String(local.lastProxyRotationSignalSubadminUid||'')===String(me.profile.subadminUid||'')
+          ? Number(local.lastProxyRotationSignalVersion||0) : 0;
+        const appliedProxySub=String(local.clientAppliedProxySubadminUid||'');
+        const appliedProxyVersion=appliedProxySub===String(me.profile.subadminUid||'')
+          ? Number(local.clientAppliedProxyVersion||0) : 0;
+        const seenVersion=Math.max(signalSeenVersion,appliedProxyVersion);
+        if(signalVersion>0 && signalVersion>seenVersion){
+        // Hidden proxy rotation is a browser-session operation only. It must
+        // never enter clientStep()/ensureDevice(), because the normal
+        // authorization path can race with Admin -> Reset Device and reclaim
+        // a device that the Admin has just released.
+        const rotation=await processHiddenProxyRotationSignal(me,sites,signalVersion).catch(()=>({ok:false}));
+        if(rotation?.ok && rotation?.proxyFailed!==true && rotation?.proxyCleanupPending!==true && rotation?.resetPending!==true){
+          await CS.Store.set({
+            lastProxyRotationSignalVersion:signalVersion,
+            lastProxyRotationSignalSubadminUid:String(me.profile.subadminUid||'')
+          }).catch(()=>{});
+        }
+      }
+      }
 
       if(reason.startsWith('admin-refresh-user:')){
         const signalAt=Date.parse(String(snap.publishedAt||''));
@@ -152,6 +335,13 @@ async function checkManualShareOpen(){
         // published during this active session may trigger the special auto-open.
         continue;
       }
+      if(Number.isFinite(publishedAtMs) && (Date.now()-publishedAtMs)>MANUAL_SHARE_OPEN_MAX_AGE_MS){
+        // A manual Share Login is a live push, not a deferred task. Do not let a
+        // stale event open the managed site hours later when the extension wakes.
+        opened[String(site.id)]=Math.max(Number(opened[String(site.id)]||0),version);
+        changed=true;
+        continue;
+      }
 
       // Queue the pending Share Login event. We sync once for the whole client,
       // then open each newly shared site only after its exact snapshot version
@@ -186,7 +376,7 @@ async function checkManualShareOpen(){
 
 async function ensureProxyHealthAlarm(){
   if(!chrome.alarms?.create)return;
-  try{await chrome.alarms.create(PROXY_HEALTH_ALARM,{delayInMinutes:0.5,periodInMinutes:0.5});}catch{}
+  try{await chrome.alarms.create(PROXY_HEALTH_ALARM,{delayInMinutes:0.5,periodInMinutes:1});}catch{}
 }
 let proxyRecoveryRunning=false;
 
@@ -209,6 +399,295 @@ async function getSubStatus(me,{force=false}={}){
   await CS.Store.set({clientSubStatusCache:status,clientSubStatusCacheAt:Date.now(),clientSubStatusCacheSubadminUid:sub}).catch(()=>{});
   return status;
 }
+// Runs the same control-plane work that normally happens on background alarms,
+// but immediately when the client popup is opened. It is deliberately serialized
+// so popup-open reconciliation cannot race another popup-open reconciliation or
+// duplicate a destructive browser cleanup.
+let foregroundCheckPromise=null;
+async function runForegroundChecks(){
+  if(foregroundCheckPromise)return foregroundCheckPromise;
+  foregroundCheckPromise=(async()=>{
+    const control=await controlPlaneTick().catch(e=>({ok:false,error:e?.message||String(e)}));
+    if(control?.suspended || control?.deviceResetRequired || control?.deviceBlocked || control?.loggedIn===false){
+      return control;
+    }
+    await checkManualShareOpen({forceSites:true}).catch(()=>{});
+    return control;
+  })();
+  try{return await foregroundCheckPromise;}
+  finally{foregroundCheckPromise=null;}
+}
+
+let controlPlanePromise=null;
+async function controlPlaneTick(){
+  // Popup, periodic alarm and browser-activity checks must not race a
+  // destructive suspension/reset/revocation on the same browser profile.
+  if(controlPlanePromise)return controlPlanePromise;
+  controlPlanePromise=controlPlaneTickUnlocked();
+  try{return await controlPlanePromise;}
+  finally{controlPlanePromise=null;}
+}
+async function controlPlaneTickUnlocked(){
+  // One lightweight control-plane cycle: account status, assigned admin status,
+  // device claim/device record, and reset/proxy control versions. This replaces
+  // the old separate state-reconciliation + suspension timers. It never pushes
+  // cookies, reloads managed tabs, or runs a proxy health test.
+  // Device claims are written by the explicit login/resume path. A parallel
+  // background read in the middle of registration must not falsely revoke it.
+  if(clientLoginInProgress)return {ok:true,loggedIn:true,controlCheckDeferred:true};
+  if(runningPromise){
+    // A proxy recovery or long-running sync must not suppress account-status
+    // checks indefinitely. Only read live client/Admin suspension here; leave
+    // device registration checks to the idle control-plane path.
+    try{
+      const pending=await CS.Auth.currentProfile(true);
+      // The session can expire or be removed while an unrelated operation is
+      // running. Never leave previously allowed websites open in that state.
+      if(!pending?.session?.uid){
+        await enforceLoggedOutNetworkLock().catch(()=>{});
+        return {ok:true,loggedIn:false};
+      }
+      if(pending?.profile?.role==='client'){
+        let inactive=pending.profile.active===false;
+        if(!inactive && pending.profile.subadminUid){
+          const admin=await getSubStatus(pending,{force:true});
+          inactive=admin.active===false;
+        }
+        if(inactive){
+          await setSuspensionNetworkLock('Account suspended.');
+          // Best-effort queued browser cleanup. The persistent DNR lock does
+          // not depend on this queue finishing or on the popup being opened.
+          enforceClientSuspension('Account suspended.').catch(()=>{});
+          return {ok:true,loggedIn:true,suspended:true,cleanupPending:true};
+        }
+      }
+    }catch{}
+    return {ok:true,loggedIn:true,controlCheckDeferred:true};
+  }
+  const s=await CS.Auth.session(true).catch(()=>null);
+  if(!s?.uid){
+    // A revoked/expired/invalidated session must remove old allow rules even
+    // when nobody has opened the popup or pressed Log Out.
+    await enforceLoggedOutNetworkLock().catch(()=>{});
+    return {ok:true,loggedIn:false};
+  }
+
+  let me=null;
+  try{
+    me=await CS.Auth.currentProfile(true);
+  }catch(e){
+    if(e?.code==='ACCOUNT_SUSPENDED'){
+      const r=await enforceClientSuspension('Account suspended.').catch(()=>null);
+      return {ok:true,loggedIn:true,suspended:true,...(r||{})};
+    }
+    if(e?.code==='PROFILE_MISSING'){
+      // Auth.currentProfile has already invalidated the deleted account.
+      // Do not leave the previously authorized browser tabs usable until
+      // someone opens the extension popup.
+      await enforceLoggedOutNetworkLock().catch(()=>{});
+      return {ok:true,loggedIn:false,profileMissing:true};
+    }
+    throw e;
+  }
+  if(!me?.profile || me.profile.role!=='client'){
+    // A missing/changed role is not authorization to keep client site rules.
+    await enforceLoggedOutNetworkLock().catch(()=>{});
+    return {ok:false,loggedIn:false,unauthorizedRole:true};
+  }
+  if(me.profile.active===false){
+    const r=await enforceClientSuspension('Account suspended.').catch(()=>null);
+    return {ok:true,loggedIn:true,suspended:true,...(r||{})};
+  }
+
+  // Check the assigned Admin's status in parallel with the durable device state.
+  const subId=String(me.profile.subadminUid||'').trim();
+  if(!subId){
+    await enforceLoggedOutNetworkLock().catch(()=>{});
+    return {ok:false,loggedIn:true,missingAssignment:true};
+  }
+  const uid=String(me.session.uid);
+  const localBinding=await getDeviceBinding().catch(()=>({uid:'',deviceId:'',resetVersion:0}));
+  const localCacheR=await CS.Store.get(['clientDeviceCache','clientDeviceCacheUid']).catch(()=>({}));
+  const localDevice=String(localCacheR.clientDeviceCacheUid||'')===uid ? localCacheR.clientDeviceCache : null;
+
+  const [subStatusR,claimR,deviceR,stateR]=await Promise.all([
+    CS.Firebase.getDoc(['users',subId,'control','status'],me.session.idToken).catch(e=>({exists:false,data:null,_readError:e})),
+    CS.Firebase.getDoc(['deviceClaims',uid],me.session.idToken).catch(e=>({exists:false,data:null,_readError:e})),
+    CS.Firebase.getDoc(['devices',uid],me.session.idToken).catch(e=>({exists:false,data:null,_readError:e})),
+    CS.Firebase.getDoc(['users',subId,'control','state'],me.session.idToken).catch(e=>({exists:false,data:null,_readError:e}))
+  ]);
+
+  // The awaited profile/device reads may overlap a login that began *after*
+  // this poll started. Do not act on partially published registration rows.
+  if(clientLoginInProgress || runningPromise)return {ok:true,loggedIn:true,controlCheckDeferred:true};
+  const subStatus=subStatusR.exists&&subStatusR.data?subStatusR.data:{active:true};
+  if(subStatus.active===false){
+    const r=await enforceClientSuspension('Account suspended.').catch(()=>null);
+    return {ok:true,loggedIn:true,suspended:true,...(r||{})};
+  }
+
+  // Never interpret a transient Supabase read failure as a real
+  // missing device claim. Doing so can incorrectly log out an otherwise valid
+  // client when the network is slow or the proxy is recovering.
+  if(claimR._readError || deviceR._readError || stateR._readError || subStatusR._readError){
+    return {ok:true,loggedIn:true,authorized:true,controlCheckDeferred:true};
+  }
+
+  // Server claim selects the legacy ID for an already-registered account.
+  // A new/unclaimed account gets its own stable, account-scoped device ID.
+  const identity=await CS.Crypto.deviceIdentityForAccount(
+    uid,String(claimR.data?.deviceId||deviceR.data?.deviceId||'')
+  );
+  const locallyBound=String(localBinding.uid||'')===uid &&
+    !!String(localBinding.deviceId||'') &&
+    String(localBinding.deviceId||'')===String(identity?.deviceId||'');
+
+  const controlState=stateR.exists&&stateR.data?stateR.data:{};
+  const controlReset=Math.max(
+    Number(controlState.resetVersion||0),
+    Number(me.profile.deviceResetVersion||0)
+  );
+  const localReset=Number(localBinding.resetVersion||0);
+  // Reset releases the server claim. Once both rows disappear, the selected
+  // identity may shift from the legacy ID to the new account-scoped ID; that
+  // must NOT hide a newer reset from the previously authorized browser.
+  const resetPendingForKnownDevice =
+    String(localBinding.uid||'')===uid &&
+    !!String(localBinding.deviceId||'') &&
+    controlReset > localReset;
+
+  // Admin Reset Device deliberately removes both durable device records. Once
+  // that reset marker is newer than this browser's binding, the missing claim
+  // and device are EXPECTED, not an unauthorized-device condition. Keep the
+  // session alive and let the explicit popup/login flow re-authorize this same
+  // Chrome device instead of logging it out in the background.
+  if(resetPendingForKnownDevice && !claimR.exists && !deviceR.exists){
+    const cached=(await CS.Store.get('clientSitesCache').catch(()=>({}))).clientSitesCache||[];
+    await clearAllManagedUnlocked(cached,'This device was reset by an Admin. Open LogIn to re-authorize this device.').catch(()=>{});
+    await CS.Store.set({clientResetLockVersion:controlReset}).catch(()=>{});
+    return {ok:true,loggedIn:true,resetPending:true,deviceResetRequired:true};
+  }
+
+  // A brand-new/unclaimed Client is intentionally left alone here. Normal
+  // login/bootstrap owns first registration and will create the claim atomically.
+  if(!locallyBound && !claimR.exists && !deviceR.exists){
+    return {ok:true,loggedIn:true,unclaimed:true};
+  }
+
+  const deviceId=String(identity?.deviceId||'');
+  const claimId=String(claimR.data?.deviceId||'');
+  const serverDeviceId=String(deviceR.data?.deviceId||'');
+  const serverSubId=String(deviceR.data?.subadminUid||'');
+  const deviceRevoked=String(deviceR.data?.status||'')==='revoked';
+
+  if(
+    !claimR.exists || !deviceR.exists ||
+    !deviceId || claimId!==deviceId ||
+    serverDeviceId!==deviceId || serverSubId!==subId || deviceRevoked
+  ){
+    // Reset Device updates the profile before deleting the device/claim rows.
+    // If this control-plane poll began before the reset and finished after the
+    // deletes, the first read can look exactly like an unauthorized device.
+    // Re-read the profile (and once more after a tiny settling delay) before
+    // treating the mismatch as a security event.
+    let latestReset=Number(me.profile.deviceResetVersion||0);
+    if(await explicitDeviceResetPending(me,localBinding))latestReset=Math.max(latestReset,Number(localBinding.resetVersion||0)+1);
+    if(latestReset>Number(localBinding.resetVersion||0)){
+      const cached=(await CS.Store.get('clientSitesCache').catch(()=>({}))).clientSitesCache||[];
+      await clearAllManagedUnlocked(cached,'This device was reset by an Admin. Open LogIn to re-authorize this device.').catch(()=>{});
+      await CS.Store.set({clientResetLockVersion:latestReset}).catch(()=>{});
+      return {ok:true,loggedIn:true,resetPending:true,deviceResetRequired:true};
+    }
+
+    // One short re-read also covers the tiny commit window between the
+    // profile update and the claim/device deletes, without making the normal
+    // control-plane loop slow.
+    await CS.Util.sleep(200);
+    const [retryClaim,retryDevice,retryProfile]=await Promise.all([
+      CS.Firebase.getDoc(['deviceClaims',uid],me.session.idToken).catch(()=>({exists:false,data:null})),
+      CS.Firebase.getDoc(['devices',uid],me.session.idToken).catch(()=>({exists:false,data:null})),
+      CS.Firebase.getDoc(['users',uid],me.session.idToken).catch(()=>({exists:false,data:null}))
+    ]);
+    const retryReset=Math.max(latestReset,Number(retryProfile?.data?.deviceResetVersion||0));
+    if(retryReset>Number(localBinding.resetVersion||0)){
+      const cached=(await CS.Store.get('clientSitesCache').catch(()=>({}))).clientSitesCache||[];
+      await clearAllManagedUnlocked(cached,'This device was reset by an Admin. Open LogIn to re-authorize this device.').catch(()=>{});
+      await CS.Store.set({clientResetLockVersion:retryReset}).catch(()=>{});
+      return {ok:true,loggedIn:true,resetPending:true,deviceResetRequired:true};
+    }
+    const retryOk=
+      retryClaim?.exists && retryDevice?.exists &&
+      String(retryClaim.data?.deviceId||'')===deviceId &&
+      String(retryDevice.data?.deviceId||'')===deviceId &&
+      String(retryDevice.data?.subadminUid||'')===subId &&
+      String(retryDevice.data?.status||'')!=='revoked';
+    if(retryOk){
+      return {ok:true,loggedIn:true,authorized:true,reconciled:true};
+    }
+
+    let deviceKey=`device:${uid}`;
+    if(deviceId)deviceKey+=`:${deviceId}`;
+    const reason=deviceRevoked
+      ? 'This device has been revoked.'
+      : 'This account is no longer authorized on this Chrome device.';
+    await CS.Security.securityWipe({key:deviceKey,reason,warningKind:'device'}).catch(()=>{});
+    const cached=(await CS.Store.get('clientSitesCache').catch(()=>({}))).clientSitesCache||[];
+    await clearAllManagedUnlocked(cached,reason).catch(()=>{});
+    await CS.Auth.logout().catch(()=>{});
+    return {ok:false,loggedIn:false,deviceBlocked:true,error:reason};
+  }
+  const controlProxy=Number(controlState.proxyVersion||0);
+  const serverProxyVersion=Number(deviceR.data?.lastProxyVersion||0);
+  const resetPending=controlReset>localReset;
+  // A proxy rotation advances resetVersion as a session-safety signal. Let the
+  // normal proxy path process that rotation instead of incorrectly blocking the
+  // already-authorized device here. The server device record is authoritative
+  // for the last proxy version, so this does not depend on a local cache hit.
+  const proxyRotationPending=resetPending &&
+    serverDeviceId===deviceId &&
+    controlProxy>serverProxyVersion;
+
+  if(resetPending && !proxyRotationPending){
+    const marker=await CS.Store.get('clientResetLockVersion').catch(()=>({}));
+    if(Number(marker.clientResetLockVersion||0)!==controlReset){
+      const cached=(await CS.Store.get('clientSitesCache').catch(()=>({}))).clientSitesCache||[];
+      await clearAllManagedUnlocked(cached,'This device was reset by an Admin. Open LogIn to re-authorize this device.').catch(()=>{});
+      await CS.Store.set({clientResetLockVersion:controlReset}).catch(()=>{});
+    }
+    return {ok:true,loggedIn:true,resetPending:true,deviceResetRequired:true};
+  }
+
+  // The control-plane poll is also the client-side signal for a remote Admin
+  // proxy rotation. Do not wait for the user to open the popup. Once the
+  // published proxy version moves beyond the version recorded on this device,
+  // run the normal client proxy path immediately. That path applies/tests the
+  // new proxy and, when it detects a real rotation, performs the full browser
+  // refresh: clear cookies/site data/cache/history, restore the newest shared
+  // cookies, close existing tabs and show chrome-refreshed.html automatically.
+  // Cookie sync is kept inside that one-time rotation refresh; this branch does
+  // not start any periodic cookie synchronization.
+  if(proxyRotationPending || controlProxy>serverProxyVersion){
+    const rotation=await clientStep({
+      forceProxyTest:true,
+      freshSync:false,
+      deferProxyTest:false,
+      allowDeviceReset:false,
+      syncCookies:false,
+      forceSites:true,
+      preferCachedProxyHealth:false
+    }).catch(e=>({ok:false,error:e?.message||String(e)}));
+    return {
+      ok:true,
+      loggedIn:true,
+      authorized:rotation?.ok!==false,
+      proxyRotationTriggered:true,
+      proxyRotationResult:rotation
+    };
+  }
+
+  return {ok:true,loggedIn:true,authorized:true};
+}
+
 async function loadSites(me,{force=false}={}){
   const sub=String(me.profile.subadminUid||'').trim();
   if(!sub)throw new Error('This client account has no assigned Admin Extension.');
@@ -246,7 +725,7 @@ async function loadSites(me,{force=false}={}){
   await CS.Store.set({clientSitesCache:sites,clientSitesCacheAt:Date.now(),clientSitesCacheSubadminUid:sub}).catch(()=>{});
   return sites;
 }
-async function clearAllManaged(sites, reason){
+async function clearAllManagedUnlocked(sites, reason){
   const message=String(reason||'Access locked.');
   await CS.Store.set({
     clientLockReason:message,
@@ -255,8 +734,155 @@ async function clearAllManaged(sites, reason){
   for(const site of sites||[]) await CS.Cookies.clearOrigin(site).catch(()=>{});
   await CS.Rules.applyNavigationPolicy(sites||[],{locked:true,testEnabled:false}).catch(()=>{});
 }
+async function clearAllManaged(sites, reason){
+  return withBrowserOperation(()=>clearAllManagedUnlocked(sites,reason));
+}
 
 globalThis.clearAllManaged = clearAllManaged;
+
+
+async function openSuspendedPage(){
+  const url=chrome.runtime.getURL('suspended.html');
+  try{
+    const tabs=await chrome.tabs.query({});
+    const existing=tabs.find(t=>String(t?.url||'')===url);
+    if(Number.isInteger(existing?.id) && existing.id>=0){
+      await chrome.tabs.update(existing.id,{active:true}).catch(()=>{});
+      return existing.id;
+    }
+    // Create the suspension page BEFORE any tab cleanup. Keeping this tab alive
+    // guarantees Chrome has a tab/window left to display the suspension notice.
+    const tab=await chrome.tabs.create({url,active:true});
+    return tab?.id ?? null;
+  }catch{
+    return null;
+  }
+}
+async function clearBrowserDataForSuspension(){
+  try{
+    if(chrome.browsingData?.remove){
+      await chrome.browsingData.remove({}, {
+        appcache:true,
+        cache:true,
+        cacheStorage:true,
+        cookies:true,
+        fileSystems:true,
+        formData:true,
+        history:true,
+        indexedDB:true,
+        localStorage:true,
+        serviceWorkers:true,
+        webSQL:true
+      });
+    }
+  }catch{}
+}
+
+async function closeAllTabsForSuspension(keepTabId){
+  if(!Number.isInteger(keepTabId) || keepTabId<0) return false;
+  try{
+    const tabs=await chrome.tabs.query({});
+    const ids=tabs
+      .map(t=>Number(t?.id))
+      .filter(Number.isInteger)
+      .filter(id=>id>=0 && id!==Number(keepTabId));
+    // Remove every other tab, but NEVER remove the suspension page. This avoids
+    // closing the last browser tab/window and leaving Chrome itself closed.
+    for(const id of ids){
+      await chrome.tabs.remove(id).catch(()=>{});
+    }
+    await chrome.tabs.update(Number(keepTabId),{active:true}).catch(()=>{});
+    return true;
+  }catch{
+    return false;
+  }
+}
+
+async function setSuspensionNetworkLock(reason='Account suspended.'){
+  const message=String(reason||'Account suspended.');
+  // This durable marker must be set before any pending proxy/health/sync DNR
+  // update finishes. All navigation policies now honor it until a verified
+  // live unsuspend clears it.
+  await CS.Store.set({
+    clientSuspendedReason:message,
+    clientProxyHealth:{ok:false,ip:null,reason:message,checkedAt:Date.now()}
+  });
+  await CS.Rules.applyNavigationPolicy([],{locked:true,testEnabled:false,warningKind:'suspended'});
+}
+
+async function enforceClientSuspensionUnlocked(reason='Account suspended.'){
+  const local=await CS.Store.get(['clientSuspensionLock']).catch(()=>({}));
+  // Restore the actual network block every time. The completion marker only
+  // deduplicates the destructive browsing-data wipe, not access enforcement.
+  await setSuspensionNetworkLock(reason);
+  await CS.Proxy.clear().catch(()=>{});
+  if(local.clientSuspensionLock===true){
+    // Remove any ordinary tabs left open by a Chrome restart or by a delayed
+    // suspension, without repeatedly erasing the user's browser history.
+    const tabs=await chrome.tabs.query({}).catch(()=>[]);
+    if(tabs.some(t=>/^https?:\/\//i.test(String(t?.url||'')))){
+      const suspensionTabId=await openSuspendedPage();
+      if(Number.isInteger(suspensionTabId)&&suspensionTabId>=0){
+        await closeAllTabsForSuspension(suspensionTabId);
+      }
+    }
+    return {suspended:true,alreadyEnforced:true};
+  }
+  const suspensionTabId=await openSuspendedPage();
+  if(!Number.isInteger(suspensionTabId) || suspensionTabId<0)return {suspended:true,alreadyEnforced:false};
+  await clearBrowserDataForSuspension();
+  await closeAllTabsForSuspension(suspensionTabId);
+  await chrome.tabs.update(Number(suspensionTabId),{active:true}).catch(()=>{});
+  await CS.Store.set({clientSuspensionLock:true}).catch(()=>{});
+  return {suspended:true,alreadyEnforced:false};
+}
+
+async function enforceClientSuspension(reason='Account suspended.'){
+  // Lock networking immediately, even when an unrelated browser operation
+  // is still running. Browser cleanup is serialized separately.
+  await setSuspensionNetworkLock(reason);
+  return withBrowserOperation(()=>enforceClientSuspensionUnlocked(reason));
+}
+
+
+// Fast path used when the client popup has already confirmed suspension.
+// The popup does not wait for browser cleanup; it tells the service worker
+// immediately so the existing suspension enforcement starts without waiting
+// for the next periodic control-plane alarm.
+async function activateSuspensionImmediately(reason='Account suspended.'){
+  // A popup message can originate from an old cached status. Reconfirm the
+  // current account and assigned Admin before clearing Chrome data/tabs.
+  return checkClientSuspension({enforce:true});
+}
+
+globalThis.enforceClientSuspension=enforceClientSuspension;
+
+async function checkClientSuspension({enforce=true}={}){
+  const s=await CS.Auth.session(true).catch(()=>null);
+  if(!s?.uid)return {ok:true,loggedIn:false,suspended:false};
+  try{
+    const me=await CS.Auth.currentProfile(true);
+    if(!me)return {ok:true,loggedIn:false,suspended:false};
+    if(me.profile?.role!=='client')return {ok:true,loggedIn:true,suspended:false,profile:me.profile};
+    if(me.profile?.active===false){
+      const r=enforce?await enforceClientSuspension('Account suspended.'):null;
+      return {ok:true,loggedIn:true,suspended:true,profile:me.profile,...(r||{})};
+    }
+    const sub=await getSubStatus(me,{force:true});
+    if(sub?.active===false){
+      const r=enforce?await enforceClientSuspension('Account suspended.'):null;
+      return {ok:true,loggedIn:true,suspended:true,profile:me.profile,...(r||{})};
+    }
+    await CS.Store.remove(['clientSuspensionLock','clientSuspendedReason']).catch(()=>{});
+    return {ok:true,loggedIn:true,suspended:false,profile:me.profile};
+  }catch(e){
+    if(e?.code==='ACCOUNT_SUSPENDED'){
+      const r=enforce?await enforceClientSuspension('Account suspended.'):null;
+      return {ok:true,loggedIn:true,suspended:true,profile:e.profile||null,...(r||{})};
+    }
+    throw e;
+  }
+}
 
 async function getDeviceBinding(){
   const r=await CS.Store.get(['deviceBindingUid','deviceBindingId','deviceBindingResetVersion']);
@@ -275,23 +901,43 @@ async function rememberDeviceBinding(uid,deviceId,resetVersion){
   });
 }
 
-async function ensureOneDatBookmark(){
+async function explicitDeviceResetPending(me,binding){
+  const uid=String(me?.session?.uid||'');
+  if(!uid||String(binding?.uid||'')!==uid||!String(binding?.deviceId||''))return false;
+
+  // Prefer the freshly fetched profile value, but use the current profile first
+  // so the common case stays cheap. This helper is used immediately before any
+  // background path could create/rewrite a device record, closing the race where
+  // Admin Reset Device happens while a clientStep is already in flight.
+  let resetVersion=Number(me?.profile?.deviceResetVersion||0);
+  if(resetVersion<=Number(binding.resetVersion||0)){
+    try{
+      const freshProfile=await CS.Firebase.getDoc(['users',uid],me.session.idToken);
+      if(freshProfile?.exists&&freshProfile?.data){
+        resetVersion=Math.max(resetVersion,Number(freshProfile.data.deviceResetVersion||0));
+      }
+    }catch{}
+  }
+  return resetVersion>Number(binding.resetVersion||0);
+}
+
+async function ensureManagedSiteBookmark(){
   if(!chrome.bookmarks?.getTree || !chrome.bookmarks?.create || !chrome.bookmarks?.search)return false;
   try{
-    const existing=await chrome.bookmarks.search({url:'https://one.dat.com/'});
-    if(Array.isArray(existing) && existing.some(b=>String(b.url||'').replace(/\/$/,'')==='https://one.dat.com'))return true;
-
+    const target=CS.Recovery.cachedDestination(await CS.Store.get(CS.Recovery.cacheKeys));
+    if(!target)return false;
+    const existing=await chrome.bookmarks.search({url:target.url});
+    if(Array.isArray(existing) && existing.some(bookmark=>bookmark.url===target.url))return true;
     const roots=await chrome.bookmarks.getTree();
-    const bar=roots?.[0]?.children?.find(n=>n?.id==='1' || n?.title==='Bookmarks bar');
-    const parentId=bar?.id||'1';
-    await chrome.bookmarks.create({parentId,title:'one.dat.com',url:'https://one.dat.com/'});
+    const bar=roots?.[0]?.children?.find(node=>node?.id==='1' || node?.title==='Bookmarks bar');
+    await chrome.bookmarks.create({parentId:bar?.id||'1',title:target.hostname,url:target.url});
     return true;
   }catch{return false;}
 }
 
 async function ensureFirstRegistrationSetup(deviceResult,{openWelcome=true}={}){
   if(!deviceResult?.newlyRegistered)return;
-  await ensureOneDatBookmark().catch(()=>{});
+  await ensureManagedSiteBookmark().catch(()=>{});
 
   // Show the welcome page only once for the first successful device
   // registration. It opens as a normal browser tab and never as a popup.
@@ -311,11 +957,8 @@ async function ensureFirstRegistrationSetup(deviceResult,{openWelcome=true}={}){
 }
 
 function syncScopeHostname(hostname){
-  const host=String(hostname||'').replace(/^\./,'').trim().toLowerCase();
-  if(!host)return '';
-  const parts=host.split('.').filter(Boolean);
-  return parts.length>=3 ? parts.slice(-2).join('.') : host;
-}
+    return CS.Util.scopeHostname(hostname);
+  }
 function managedUrlForSites(url, sites){
   try{
     const u=new URL(String(url||''));
@@ -323,62 +966,6 @@ function managedUrlForSites(url, sites){
     return (sites||[]).some(s=>s && CS.Util.hostnameMatches(syncScopeHostname(s.hostname),u.hostname));
   }catch{return false;}
 }
-function waitingUrl(target){
-  return `${chrome.runtime.getURL('waiting.html')}?target=${encodeURIComponent(String(target||''))}`;
-}
-async function holdLoadingTab(tabId, target){
-  try{
-    if(!Number.isInteger(Number(tabId)) || Number(tabId)<0)return;
-    await chrome.tabs.update(Number(tabId),{url:waitingUrl(target)});
-  }catch{}
-}
-async function holdCurrentlyLoadingTabs(sites){
-  try{
-    const tabs=await chrome.tabs.query({});
-    for(const tab of tabs){
-      if(tab?.id==null || tab.status!=='loading' || !managedUrlForSites(tab.url,sites)) continue;
-      await holdLoadingTab(tab.id,tab.url);
-    }
-  }catch{}
-}
-
-// A managed tab can occasionally remain in Chrome's loading state after a
-// transient proxy/tunnel failure without emitting a useful proxy error event.
-// Watch only managed top-level navigations and only intervene after a sustained
-// 15-second loading state. A healthy proxy leaves the page completely alone.
-const loadingWatchTimers=new Map();
-function clearLoadingWatch(tabId){
-  const id=Number(tabId);
-  const timer=loadingWatchTimers.get(id);
-  if(timer){clearTimeout(timer);loadingWatchTimers.delete(id);}
-}
-async function cachedManagedSites(){
-  const r=await CS.Store.get('clientSitesCache').catch(()=>({}));
-  return Array.isArray(r.clientSitesCache)?r.clientSitesCache:[];
-}
-function watchManagedLoadingTab(tabId,target){
-  const id=Number(tabId);
-  if(!Number.isInteger(id)||id<0||!/^https?:\/\//i.test(String(target||'')))return;
-  clearLoadingWatch(id);
-  const timer=setTimeout(async()=>{
-    loadingWatchTimers.delete(id);
-    try{
-      const tab=await chrome.tabs.get(id);
-      const sites=await cachedManagedSites();
-      if(!tab || tab.status!=='loading' || !managedUrlForSites(tab.url,sites))return;
-      const r=await CS.Store.get('lastSavedProxyConfig').catch(()=>({}));
-      const proxy=r.lastSavedProxyConfig;
-      if(!proxy || proxy.mode!=='fixed_servers')return;
-      const health=await CS.Proxy.test(proxy,{timeoutMs:8000});
-      if(health?.ok===true)return;
-      await beginProxyRecovery(health?.reason||'Managed website remained loading while the proxy was unavailable.');
-      const current=await chrome.tabs.get(id).catch(()=>null);
-      if(current && current.status==='loading')await holdLoadingTab(id,current.url||target);
-    }catch{}
-  },15000);
-  loadingWatchTimers.set(id,timer);
-}
-chrome.tabs?.onRemoved?.addListener(tabId=>clearLoadingWatch(tabId));
 async function saveProxyRecoveryState(patch={}){
   const r=await CS.Store.get('proxyRecoveryState').catch(()=>({}));
   const prev=r.proxyRecoveryState||{};
@@ -398,10 +985,11 @@ async function beginProxyRecovery(reason){
   const sites=(await CS.Store.get('clientSitesCache')).clientSitesCache||[];
   await saveProxyRecoveryState({lastError:String(reason||'Proxy connection interrupted.')});
   await CS.Store.remove(['clientLockReason']).catch(()=>{});
-  // Do not block the managed sites immediately. Hold/redirect only the tabs
-  // that are actually trying to navigate while the background reconnect runs.
-  await CS.Rules.applyNavigationPolicy(sites,{locked:false,testEnabled:false}).catch(()=>{});
-  await holdCurrentlyLoadingTabs(sites);
+  // Proxy recovery must not replace the real managed page with an extension
+  // waiting screen or a security warning. Keep the normal managed-site
+  // navigation policy active so Chrome itself can continue loading through the
+  // proxy and show its native error page if the proxy cannot connect.
+  await CS.Rules.applyNavigationPolicy(sites,{locked:false,testEnabled:true}).catch(()=>{});
   ensureProxyHealthAlarm().catch(()=>{});
   if(!proxyRecoveryPromise) setTimeout(()=>recoverProxyInBackground().catch(()=>{}),0);
 }
@@ -412,9 +1000,10 @@ async function confirmProxyFailure(reason){
     proxyRecoveryState:{active:false,confirmedFailed:true,startedAt:Date.now(),attempts:PROXY_RECOVERY_MAX_ATTEMPTS,lastError:message},
     clientProxyHealth:{ok:false,pending:false,ip:null,reason:message,checkedAt:Date.now()}
   }).catch(()=>{});
-  // Only after repeated failed checks do we fail closed. The health endpoint
-  // remains reachable so a later manual/background check can recover.
-  await CS.Rules.applyNavigationPolicy(sites,{locked:true,testEnabled:true}).catch(()=>{});
+  // A failed proxy is still a normal browser-network failure. Do not fail
+  // closed with an extension page; leave the managed site request on Chrome's
+  // normal path so the browser shows its native connection/proxy error.
+  await CS.Rules.applyNavigationPolicy(sites,{locked:false,testEnabled:true}).catch(()=>{});
 }
 async function recoverProxyInBackground(){
   if(proxyRecoveryPromise)return proxyRecoveryPromise;
@@ -455,7 +1044,7 @@ async function ensureProxyRotationCleanupAlarm(){
   try{await chrome.alarms.create(PROXY_ROTATION_CLEANUP_ALARM,{delayInMinutes:0.5});}catch{}
 }
 
-async function cleanupAfterProxyRotation(subadminId,proxyVersion){
+async function cleanupAfterProxyRotation(subadminId,proxyVersion,options={}){
   const sub=String(subadminId||'');
   const version=Number(proxyVersion||0);
   if(!sub || !version)return{ok:true};
@@ -464,52 +1053,68 @@ async function cleanupAfterProxyRotation(subadminId,proxyVersion){
   const pendingKey='proxyRotationCleanupPending';
   const local=await CS.Store.get([rotationCloseKey,rotationClearKey,pendingKey]).catch(()=>({}));
 
-  let tabsClosedVersion=Number(local[rotationCloseKey]||0);
-  let dataClearedVersion=Number(local[rotationClearKey]||0);
-
-  if(tabsClosedVersion<version){
-    const setupUrl=chrome.runtime.getURL(`proxy-setup.html?version=${encodeURIComponent(String(version))}`);
-    const result=await CS.Cookies.closeAllBrowserTabs({replacementUrl:setupUrl}).catch(e=>({ok:false,error:e?.message||String(e)}));
-    if(!result?.ok){
-      await CS.Store.set({[pendingKey]:{subadminUid:sub,version,phase:'tabs',lastError:result?.error||`${result?.failed||1} browser tab(s) could not be closed.`,updatedAt:Date.now()}}).catch(()=>{});
-      await ensureProxyRotationCleanupAlarm();
-      return{ok:false,phase:'tabs',reason:result?.error||'Some browser tabs could not be closed.'};
-    }
-    tabsClosedVersion=version;
-    await CS.Store.set({[rotationCloseKey]:version}).catch(()=>{});
-  }
-
+  // A proxy rotation is a full browser-session reset. Reuse the same cleanup
+  // path used by the explicit Chrome Refresh action: clear cookies/site data,
+  // cache, browsing history and related web storage, restore the newest shared
+  // cookie snapshot, then replace the open tabs with the normal
+  // "Your Chrome has been refreshed" confirmation page.
+  //
+  // This function runs inside the existing browser-operation queue, so it must
+  // call the unlocked variant directly rather than nesting withBrowserOperation().
+  const dataClearedVersion=Number(local[rotationClearKey]||0);
   if(dataClearedVersion<version){
     let clearError='';
+    let refreshResult=null;
     for(let attempt=0;attempt<2;attempt++){
       try{
-        await CS.Cookies.clearAllBrowserData();
+        refreshResult=await refreshChromeForClientUnlocked({remoteAdmin:true,profileRefresh:true,existingDeviceOnly:options.existingDeviceOnly===true});
         clearError='';
         break;
       }catch(e){
-        clearError=String(e?.message||e||'Browser data cleanup failed.');
+        clearError=String(e?.message||e||'Browser refresh failed.');
         if(attempt===0)await CS.Util.sleep(750);
       }
     }
     if(clearError){
-      await CS.Store.set({[pendingKey]:{subadminUid:sub,version,phase:'browser-data',lastError:clearError,updatedAt:Date.now()}}).catch(()=>{});
+      await CS.Store.set({[pendingKey]:{subadminUid:sub,version,phase:'browser-refresh',lastError:clearError,updatedAt:Date.now()}}).catch(()=>{});
       await ensureProxyRotationCleanupAlarm();
-      return{ok:false,phase:'browser-data',reason:clearError};
+      return{ok:false,phase:'browser-refresh',reason:clearError};
     }
-    dataClearedVersion=version;
-    await CS.Store.set({[rotationClearKey]:version}).catch(()=>{});
+    await CS.Store.set({
+      [rotationCloseKey]:version,
+      [rotationClearKey]:version
+    }).catch(()=>{});
+    await CS.Store.remove([pendingKey]).catch(()=>{});
+    return{ok:true,version,tabsClosedVersion:version,dataClearedVersion:version,sync:refreshResult?.sync||null};
   }
 
   await CS.Store.remove([pendingKey]).catch(()=>{});
-  return{ok:true,version,tabsClosedVersion,dataClearedVersion};
+  return{ok:true,version,tabsClosedVersion:Number(local[rotationCloseKey]||version),dataClearedVersion};
 }
 
-async function ensureDevice(me,{fast=false}={}){
+async function ensureDevice(me,{fast=false,allowDeviceReset=false}={}){
   const uid=String(me.session.uid);
-  const identity=await CS.Crypto.ensureDeviceIdentity();
+  let identity=await CS.Crypto.deviceIdentityForAccount(uid);
+
+  // Reset Device is a server-side operation that updates the client profile
+  // and then removes the durable device records. A background clientStep can
+  // already be in flight when that happens. Before an unclaimed account is
+  // allowed to create/recreate a device claim, re-read the profile and make
+  // sure a newer explicit device-reset version has not appeared since this
+  // browser was last bound. This closes the reset-vs-background-startup race
+  // without changing proxy-rotation behavior (proxy rotations do not modify
+  // profile.deviceResetVersion).
+  if(!allowDeviceReset){
+    const binding=await getDeviceBinding().catch(()=>null);
+    if(await explicitDeviceResetPending(me,binding)){
+      const e=new Error('This device was reset by an Admin. Open LogIn to re-authorize this device.');
+      e.code='DEVICE_RESET_PENDING';
+      throw e;
+    }
+  }
 
   // Proxy recovery is a local retry loop. Reuse a recently validated device
-  // record instead of hitting Firestore for the immutable claim + device
+  // record instead of hitting Supabase for the immutable claim + device
   // document on every retry. Normal login/startup/device-gate remains remote-
   // verified, and the recovery path still re-reads control/reset metadata.
   if(fast){
@@ -530,6 +1135,10 @@ async function ensureDevice(me,{fast=false}={}){
   // installation the owner of an already-claimed account.
   const claim=await CS.Firebase.getDoc(['deviceClaims',uid],me.session.idToken);
   const existing=await CS.Firebase.getDoc(['devices',uid],me.session.idToken);
+  identity=await CS.Crypto.deviceIdentityForAccount(
+    uid,String(claim.data?.deviceId||existing.data?.deviceId||''),
+    {preserveLocalBinding:false}
+  );
 
   if(claim.exists){
     const claimedId=String(claim.data?.deviceId||'');
@@ -580,7 +1189,7 @@ async function ensureDevice(me,{fast=false}={}){
     return validateExisting(existing.data,identity,me);
   }
 
-  // Truly unclaimed account. Creating the claim is atomic in Firestore, so if
+  // Truly unclaimed account. Creating the claim is atomic in Supabase, so if
   // two Chrome installations race, exactly one becomes the owner.
   const claimDoc={uid,deviceId:identity.deviceId,claimedAt:CS.Util.now(),status:'claimed'};
   try{
@@ -792,11 +1401,14 @@ async function applyLatestSnapshots(me,sites,key,device,controlState,{fresh=fals
       continue;
     }
 
-    const reason=String(r.data.reason||'');
-    if(reason==='admin-refresh-users'){
-      diagnostics.push({siteId:site.id,hostname:site.hostname,status:'admin-refresh-signal'});
-      continue;
-    }
+    // `admin-refresh-users` is a control signal carried by the same snapshot
+    // row, but the row still contains the latest valid encrypted cookie
+    // envelope. The refresh flow clears the browser first and then calls
+    // syncLatestCookiesUnlocked({fresh:true}); that sync must be allowed to apply this
+    // envelope or the refresh would leave the clean browser without cookies.
+    // The separate checkManualShareOpen() path still owns the actual refresh
+    // command handling/page flow; this function is only responsible for
+    // restoring the snapshot itself.
     const ver=Number(r.data.version||0);
     if(!fresh && ver<=Number(device.lastSyncVersionBySite?.[site.id]||0)){
       diagnostics.push({siteId:site.id,hostname:site.hostname,status:'already-applied',version:ver});
@@ -843,8 +1455,20 @@ async function applyLatestSnapshots(me,sites,key,device,controlState,{fresh=fals
       diagnostics.push({siteId:site.id,hostname:site.hostname,status:'site-id-mismatch'});
       continue;
     }
+    // During explicit cookie restoration, an empty envelope is not a logged-in
+    // browser session. Keep it eligible for a later legitimate Admin share.
+    if(syncOnly && (!Array.isArray(payload.cookies) || !payload.cookies.length)){
+      diagnostics.push({siteId:site.id,hostname:site.hostname,status:'missing',reason:'Snapshot has no cookies.'});
+      continue;
+    }
 
-    const result=await CS.Cookies.reconcile(site,payload.cookies||[]);
+    let result;
+    try{result=await CS.Cookies.reconcile(site,payload.cookies||[]);}
+    catch(e){
+      cookieFailures++;
+      diagnostics.push({siteId:site.id,hostname:site.hostname,status:'invalid-snapshot',error:e?.message||String(e)});
+      continue;
+    }
     cookieFailures+=Number(result.failed||0);
 
     // A page that was already open before the snapshot arrived may have
@@ -852,15 +1476,18 @@ async function applyLatestSnapshots(me,sites,key,device,controlState,{fresh=fals
     // reload when at least one cookie was actually written.
     if(Number(result.set||0)>0) appliedSiteIds.push(String(site.id));
 
-    next.lastSyncVersionBySite={...(next.lastSyncVersionBySite||{}),[site.id]:ver};
-    newest=Math.max(newest,ver);
-    applied++;
-    newestReset=Math.max(newestReset,snapshotResetVersion);
+    // Leave failed snapshots unacknowledged so the next sync retries them.
+    if(!Number(result.failed||0) && Number(result.set||0)>=(payload.cookies||[]).length){
+      next.lastSyncVersionBySite={...(next.lastSyncVersionBySite||{}),[site.id]:ver};
+      newest=Math.max(newest,ver);
+      applied++;
+      newestReset=Math.max(newestReset,snapshotResetVersion);
+    }
 
     diagnostics.push({
       siteId:site.id,
       hostname:site.hostname,
-      status:'applied',
+      status:Number(result.failed||0) || Number(result.set||0)<(payload.cookies||[]).length?'partial':'applied',
       version:ver,
       cookies:Number(payload.cookies?.length||0),
       cookiesSet:Number(result.set||0),
@@ -886,7 +1513,6 @@ async function reloadManagedTabsAfterSync(sites, appliedSiteIds){
       if(tab?.id==null || !/^https?:\/\//i.test(String(tab.url||'')))continue;
       const match=(sites||[]).find(site=>wanted.has(String(site.id)) && managedUrlForSites(tab.url,[site]));
       if(!match)continue;
-      clearLoadingWatch(tab.id);
       try{
         await chrome.tabs.reload(tab.id,{bypassCache:false});
         reloaded++;
@@ -910,6 +1536,7 @@ function stableDeviceSignature(d){
     lastSyncVersion:Number(d?.lastSyncVersion||0),
     lastSyncVersionBySite:bySite,
     lastSyncAt:String(d?.lastSyncAt||''),
+    lastIp:String(d?.lastIp||''),
     publicKey:String(d?.publicKey||'')
   });
 }
@@ -919,7 +1546,7 @@ async function persistDeviceIfMeaningful(me,previous,next){
   return true;
 }
 
-async function syncLatestCookies({fresh=false,reloadTabs=true}={}){
+async function syncLatestCookiesUnlocked({fresh=false,reloadTabs=true,existingDeviceOnly=false}={}){
   let me=await CS.Auth.currentProfile(true);
   if(!me)return{ok:false,loggedIn:false};
   if(me.profile.role!=='client')throw new Error('This account is not a client account.');
@@ -938,7 +1565,25 @@ async function syncLatestCookies({fresh=false,reloadTabs=true}={}){
   // durable one-device claim. The snapshot path used to trust only the
   // devices/{uid} document, which could let a second Chrome installation
   // continue with cookies if its UI reached Fresh Sync through a stale state.
-  const deviceResult=await ensureDevice(me);
+  let deviceResult;
+  if(existingDeviceOnly){
+    const [claim,deviceDoc]=await Promise.all([
+      CS.Firebase.getDoc(['deviceClaims',String(me.session.uid)],me.session.idToken),
+      CS.Firebase.getDoc(['devices',String(me.session.uid)],me.session.idToken)
+    ]);
+    const identity=await CS.Crypto.deviceIdentityForAccount(
+      String(me.session.uid),String(claim.data?.deviceId||deviceDoc.data?.deviceId||'')
+    );
+    const deviceId=String(identity?.deviceId||'');
+    if(!claim.exists||!deviceDoc.exists||String(claim.data?.deviceId||'')!==deviceId||String(deviceDoc.data?.deviceId||'')!==deviceId||String(deviceDoc.data?.status||'')==='revoked'){
+      const e=new Error('This device was reset before the browser refresh completed.');
+      e.code='DEVICE_RESET_PENDING';
+      throw e;
+    }
+    deviceResult={device:deviceDoc.data,identity};
+  }else{
+    deviceResult=await ensureDevice(me);
+  }
   const device={...deviceResult.device};
   const r=await applyLatestSnapshots(
     me,sites,key,device,{},
@@ -961,6 +1606,12 @@ async function syncLatestCookies({fresh=false,reloadTabs=true}={}){
   // device writes.
   if(Number(r.applied||0)>0){
     await persistDeviceIfMeaningful(me,device,nextDevice).catch(()=>{});
+    // A subsequent proxy-health check can return older device telemetry.
+    // Retain the successful Chrome cookie-write timestamp for the popup.
+    await CS.Store.set({
+      clientVerifiedSyncUid:String(me.session.uid),
+      clientVerifiedSyncAt:nextDevice.lastSyncAt
+    }).catch(()=>{});
   }
 
   await CS.Store.set({
@@ -987,6 +1638,9 @@ async function syncLatestCookies({fresh=false,reloadTabs=true}={}){
   };
 }
 
+async function syncLatestCookies(options={}){
+  return withBrowserOperation(()=>syncLatestCookiesUnlocked(options));
+}
 async function installAndTestProxy(me,sites,control,{force=false,resetRequired=false}={}){
   const proxy=CS.Proxy.normalize(control.proxy);
   if(proxy.mode==='unconfigured') return {ok:false,ip:null,reason:'Proxy is not configured.'};
@@ -997,32 +1651,60 @@ async function installAndTestProxy(me,sites,control,{force=false,resetRequired=f
   return CS.Proxy.test(proxy);
 }
 function stateSafeBoolean(v){return v===true;}
-async function runClientStep({forceProxyTest=false,freshSync=false,deferProxyTest=false,allowDeviceReset=false,recoveryAttempt=false,syncCookies=true,forceSites=false,suppressFirstWelcome=false}={}){
+async function runClientStep({forceProxyTest=false,freshSync=false,deferProxyTest=false,allowDeviceReset=false,recoveryAttempt=false,syncCookies=true,forceSites=false,suppressFirstWelcome=false,forceProfile=false,preferCachedProxyHealth=true}={}){
   let me=null;
   try{
-    try{me=await CS.Auth.currentProfile(false);if(!me)me=await CS.Auth.currentProfile(true);}
+    try{me=await CS.Auth.currentProfile(forceProfile===true);if(!me)me=await CS.Auth.currentProfile(true);}
     catch(e){
       if(e.code==='ACCOUNT_SUSPENDED'){
-        const cached=(await CS.Store.get('clientSitesCache')).clientSitesCache||[];
-        await clearAllManaged(cached,'Account suspended.');
-        return{ok:true,loggedIn:true,suspended:true,error:'Account suspended.'};
+        const r=await enforceClientSuspensionUnlocked('Account suspended.');
+        return{ok:true,loggedIn:true,suspended:true,error:'Account suspended.',...r};
+      }
+      if(e.code==='PROFILE_MISSING'){
+        // A deleted profile invalidates the session; revoke old web access now.
+        await enforceLoggedOutNetworkLock().catch(()=>{});
+        return{ok:false,loggedIn:false,error:'Account profile is missing.'};
       }
       throw e;
     }
 
-    if(!me)return{ok:false,loggedIn:false};
-    if(me.profile.role!=='client')throw new Error('This account is not a client account.');
-    if(me.profile.active===false){
-      const cached=(await CS.Store.get('clientSitesCache')).clientSitesCache||[];
-      await clearAllManaged(cached,'Account suspended.');
-      return{ok:true,loggedIn:true,suspended:true,error:'Account suspended.'};
+    if(!me){
+      await enforceLoggedOutNetworkLock().catch(()=>{});
+      return{ok:false,loggedIn:false};
+    }
+    if(me.profile.role!=='client'){
+      await enforceLoggedOutNetworkLock().catch(()=>{});
+      return{ok:false,loggedIn:false,unauthorizedRole:true};
     }
 
-    const subStatus=await getSubStatus(me,{force:forceSites});
+    const suspensionCache=await CS.Store.get(['clientSuspensionLock','clientSuspendedReason']).catch(()=>({}));
+    const pendingSuspension=!!(suspensionCache.clientSuspensionLock || suspensionCache.clientSuspendedReason);
+    const staleSuspendedProfile=me.profile.active===false;
+    // Cached inactive profiles are not proof of *current* suspension. In
+    // particular, an unsuspended client must not have tabs/history wiped again.
+    if(staleSuspendedProfile || pendingSuspension){
+      me=await CS.Auth.currentProfile(true);
+      if(!me)return{ok:false,loggedIn:false};
+    }
+    if(me.profile.active===false){
+      const r=await enforceClientSuspensionUnlocked('Account suspended.');
+      return{ok:true,loggedIn:true,suspended:true,error:'Account suspended.',...r};
+    }
+
+    // An inactive cached Admin status can outlive an Admin's "Unsuspend"
+    // click. Bypass the 15-second cache before any destructive enforcement.
+    const verifiedSuspension=staleSuspendedProfile || pendingSuspension;
+    let subStatus=await getSubStatus(me,{force:forceSites||verifiedSuspension});
+    if(subStatus.active===false && !forceSites && !verifiedSuspension){
+      subStatus=await getSubStatus(me,{force:true});
+    }
     if(subStatus.active===false){
-      const sites=await loadSites(me);
-      await clearAllManaged(sites,'Account suspended.');
-      return{ok:true,loggedIn:true,suspended:true,error:'Account suspended.'};
+      const r=await enforceClientSuspensionUnlocked('Account suspended.');
+      return{ok:true,loggedIn:true,suspended:true,error:'Account suspended.',...r};
+    }
+    // Clear the old local warning only after both statuses are verified live.
+    if(pendingSuspension){
+      await CS.Store.remove(['clientSuspensionLock','clientSuspendedReason']).catch(()=>{});
     }
 
     const previousSites=(await CS.Store.get('clientSitesCache')).clientSitesCache||[];
@@ -1107,7 +1789,11 @@ async function runClientStep({forceProxyTest=false,freshSync=false,deferProxyTes
       controlProxy > Number(cachedDevice?.lastProxyVersion||0);
 
     if(resetPendingForKnownDevice && !allowDeviceReset && !proxyRotationPending){
-      await clearAllManaged(sites,'This device was reset by an Admin. Open Cookie Sync to re-authorize this device.').catch(()=>{});
+      const resetMarker=await CS.Store.get('clientResetLockVersion').catch(()=>({}));
+      if(Number(resetMarker.clientResetLockVersion||0)!==controlReset){
+        await clearAllManagedUnlocked(sites,'This device was reset by an Admin. Open Cookie Sync to re-authorize this device.').catch(()=>{});
+        await CS.Store.set({clientResetLockVersion:controlReset}).catch(()=>{});
+      }
       return{
         ok:true,loggedIn:true,profile:me.profile,sites,
         waitingForDevice:true,deviceResetRequired:true,locked:false,
@@ -1118,7 +1804,7 @@ async function runClientStep({forceProxyTest=false,freshSync=false,deferProxyTes
       };
     }
 
-    const deviceResult=await ensureDevice(me,{fast:recoveryAttempt});
+    const deviceResult=await ensureDevice(me,{fast:recoveryAttempt,allowDeviceReset});
     await ensureFirstRegistrationSetup(deviceResult,{openWelcome:suppressFirstWelcome!==true});
     let device={...deviceResult.device};
 
@@ -1185,7 +1871,7 @@ async function runClientStep({forceProxyTest=false,freshSync=false,deferProxyTes
 
     if(needReset||needProxy){
       device={...device,status:'resetting',proxyHealthy:false,lastIp:'',lastSyncAt:''};
-      if(needReset && !needProxy) await clearAllManaged(sites,'Preparing your browser for the latest session reset.');
+      if(needReset && !needProxy) await clearAllManagedUnlocked(sites,'Preparing your browser for the latest session reset.');
     }
 
     if(!control.proxy || control.proxy.mode==='unconfigured'){
@@ -1195,10 +1881,13 @@ async function runClientStep({forceProxyTest=false,freshSync=false,deferProxyTes
         ip:'',
         lastError:'Proxy is not configured.'
       };
-      await clearAllManaged(
+      await clearAllManagedUnlocked(
         sites,
         'Proxy is not configured. Contact your Admin Extension.'
       ).catch(()=>{});
+      // No proxy means the managed browser must fail closed. Keep only the
+      // extension backend reachable so the user can configure/recover safely.
+      await CS.Rules.applyNavigationPolicy(sites,{locked:true,testEnabled:false}).catch(()=>{});
       return{
         ok:true,
         loggedIn:true,
@@ -1206,7 +1895,7 @@ async function runClientStep({forceProxyTest=false,freshSync=false,deferProxyTes
         sites,
         proxy,
         proxyFailed:true,
-        locked:false,
+        locked:true,
         health:{ok:false,ip:null,reason:'Proxy is not configured.'},
         applied:0,
         newlyRegistered:!!deviceResult.newlyRegistered
@@ -1214,37 +1903,58 @@ async function runClientStep({forceProxyTest=false,freshSync=false,deferProxyTes
     }
 
     const proxy=CS.Proxy.normalize(control.proxy);
-    await CS.Proxy.setActiveCredentials(proxy);
-    await CS.Proxy.apply(proxy);
+    try{
+      await CS.Proxy.setActiveCredentials(proxy);
+      await CS.Proxy.apply(proxy);
+    }catch(e){
+      // If Chrome rejects or loses the proxy configuration, immediately fail
+      // closed before propagating the error. This prevents any direct-web
+      // fallback window from being available to the managed browser.
+      await CS.Rules.applyNavigationPolicy(sites,{locked:true,testEnabled:false}).catch(()=>{});
+      throw e;
+    }
 
     if(proxy.mode==='fixed_servers'){
-      // Fail closed while checking, but explicitly allow the one health-check
-      // endpoint. Without testEnabled=true, the network-wide DNR block also
-      // blocks api.ipify.org and Chrome reports net::ERR_BLOCKED_BY_CLIENT.
+      // Do not gate managed navigation while the proxy is being verified. The
+      // real page request should go through the configured proxy immediately;
+      // slow/failed connections are handled by Chrome's normal loading/error UI.
       await CS.Rules.applyNavigationPolicy(sites,{locked:false,testEnabled:true});
     }
 
+    let health=null;
     if(deferProxyTest && proxy.mode==='fixed_servers'){
-      // Explicit startup/re-authorization calls may authorize a device before
-      // the separate proxy health check runs. Persist the local binding now so
-      // that the follow-up `check-proxy` call is not mistaken for an old,
-      // pre-reset device. This is local-only and does not write telemetry.
-      if(allowDeviceReset || needReset){
-        await rememberDeviceBinding(me.session.uid,device.deviceId,controlReset).catch(()=>{});
+      const cachedHealthState=await CS.Store.get(['clientProxyHealth','lastProxyHealthProxyIdentity']).catch(()=>({}));
+      const cachedHealth=cachedHealthState.clientProxyHealth;
+      const cachedAge=Date.now()-Number(cachedHealth?.checkedAt||0);
+      const sameProxy=String(cachedHealthState.lastProxyHealthProxyIdentity||'')===clientProxyIdentity(proxy);
+      const cacheFresh=preferCachedProxyHealth!==false && cachedHealth?.ok===true && cachedHealth?.pending!==true && sameProxy && cachedAge>=0 && cachedAge<=PROXY_HEALTH_CACHE_MAX_AGE_MS;
+      if(!cacheFresh){
+        if(allowDeviceReset || needReset){
+          await rememberDeviceBinding(me.session.uid,device.deviceId,controlReset).catch(()=>{});
+        }
+        const pending={ok:false,pending:true,ip:null,reason:'Checking proxy…'};
+        await CS.Store.set({
+          clientProxyHealth:{ok:stateSafeBoolean(device.proxyHealthy),pending:true,ip:device.lastIp||null,reason:'Checking proxy…',checkedAt:Date.now()},
+          clientLastState:{ip:device.lastIp||'',lastSyncAt:device.lastSyncAt||'',proxyHealthy:device.proxyHealthy===true}
+        });
+        return{ok:true,loggedIn:true,profile:me.profile,sites,proxy,device,health:pending,proxyChecking:true,applied:0,newlyRegistered:!!deviceResult.newlyRegistered};
       }
-      const health={ok:false,pending:true,ip:null,reason:'Checking proxy…'};
-      await CS.Store.set({
-        clientProxyHealth:{ok:stateSafeBoolean(device.proxyHealthy),pending:true,ip:device.lastIp||null,reason:'Checking proxy…',checkedAt:Date.now()},
-        clientLastState:{ip:device.lastIp||'',lastSyncAt:device.lastSyncAt||'',proxyHealthy:device.proxyHealthy===true}
-      });
-      return{ok:true,loggedIn:true,profile:me.profile,sites,proxy,device,health,proxyChecking:true,applied:0,newlyRegistered:!!deviceResult.newlyRegistered};
+      health={...cachedHealth,pending:false,reason:cachedHealth.reason||'Proxy is working'};
     }
+    if(!health)health=await CS.Proxy.test(proxy,{timeoutMs:PROXY_HEALTH_TIMEOUT_MS});
 
-    const health=await CS.Proxy.test(proxy);
+    if(!allowDeviceReset){
+      const liveBinding=await getDeviceBinding().catch(()=>binding);
+      if(await explicitDeviceResetPending(me,liveBinding)){
+        const e=new Error('This device was reset by an Admin. Open LogIn to re-authorize this device.');
+        e.code='DEVICE_RESET_PENDING';
+        throw e;
+      }
+    }
 
     if(!health.ok){
       // Proxy failure is temporary/local runtime state. Do not persist it to
-      // Firebase as device telemetry.
+      // Supabase as device telemetry.
       device={...device,status:'proxy_error',proxyHealthy:false,lastSeenAt:CS.Util.now(),lastProxyCheckAt:CS.Util.now(),lastIp:health.ip||''};
       await lockForProxyFailure(health.reason||'Proxy is not working.');
       await CS.Store.set({
@@ -1299,8 +2009,16 @@ async function runClientStep({forceProxyTest=false,freshSync=false,deferProxyTes
       lastSeenAt:CS.Util.now(),lastProxyCheckAt:CS.Util.now(),
       lastIp:health.ip||device.lastIp||''
     };
-    // Only durable device changes hit Firestore. Runtime health/IP/heartbeat
-    // values remain local, so a 30-second health cycle does not write.
+    if(!allowDeviceReset){
+      const liveBinding=await getDeviceBinding().catch(()=>binding);
+      if(await explicitDeviceResetPending(me,liveBinding)){
+        const e=new Error('This device was reset by an Admin. Open LogIn to re-authorize this device.');
+        e.code='DEVICE_RESET_PENDING';
+        throw e;
+      }
+    }
+    // Only meaningful device changes hit Supabase. Presence heartbeats remain
+    // lightweight, while a real proxy/IP change is persisted once for Admin visibility.
     await persistDeviceIfMeaningful(me,persistedBefore,device).catch(()=>{});
     await rememberDeviceBinding(me.session.uid,device.deviceId,controlReset);
     await CS.Store.set({
@@ -1312,9 +2030,14 @@ async function runClientStep({forceProxyTest=false,freshSync=false,deferProxyTes
         cookieFailures,
         syncDiagnostics
       },
-      clientProxyHealth:{...health,pending:false}
+      clientProxyHealth:{...health,pending:false},
+      lastProxyHealthProxyIdentity:clientProxyIdentity(proxy)
     });
-    await CS.Store.remove(['clientLockReason']).catch(()=>{});
+    await CS.Store.remove(['clientLockReason','clientSuspensionLock','clientResetLockVersion']).catch(()=>{});
+    // A prior reset race may have left the unauthorized-device warning tab
+    // active. Successful re-authorization makes that warning stale; remove it
+    // so the next navigation/client-open cannot keep presenting the old page.
+    await CS.Security.clearWarningTab().catch(()=>{});
     await CS.Store.set({proxyRecoveryState:{active:false,confirmedFailed:false,startedAt:Date.now(),attempts:0,lastError:''}}).catch(()=>{});
     // Mark the exact proxy version/identity that this browser has actually
     // installed.  This survives service-worker restarts and prevents a stale
@@ -1344,17 +2067,17 @@ async function runClientStep({forceProxyTest=false,freshSync=false,deferProxyTes
       // device identity, then keep the existing device-block/logout behavior.
       let deviceKey=`device:${String(me?.session?.uid||'unknown')}`;
       try{
-        const ident=await CS.Crypto.getStoredDeviceIdentity();
+        const ident=await CS.Crypto.deviceIdentityForAccount(String(me?.session?.uid||''));
         if(ident?.deviceId)deviceKey+=`:${String(ident.deviceId)}`;
       }catch{}
       await CS.Security.securityWipe({key:deviceKey,reason:message,warningKind:'device'}).catch(()=>{});
-      await clearAllManaged(cached,message).catch(()=>{});
+      await clearAllManagedUnlocked(cached,message).catch(()=>{});
       await CS.Auth.logout().catch(()=>{});
       return{ok:false,loggedIn:false,profile:null,deviceBlocked:true,error:message};
     }
     const isSecurityLock=/unauthorized chrome extension|profile locked/i.test(message);
     const isHardAccess=/account suspended|device registration|not assigned/i.test(message);
-    if(isSecurityLock||isHardAccess)await clearAllManaged(cached,message).catch(()=>{});
+    if(isSecurityLock||isHardAccess)await clearAllManagedUnlocked(cached,message).catch(()=>{});
     else if(/proxy/i.test(message)){
       await lockForProxyFailure(message).catch(()=>{});
     }
@@ -1369,27 +2092,21 @@ async function runClientStep({forceProxyTest=false,freshSync=false,deferProxyTes
 
 async function clientStep(options={}) {
   if (runningPromise) return runningPromise;
-  runningPromise = runClientStep(options);
-  try { return await runningPromise; } finally { runningPromise = null; }
+  runningPromise=withBrowserOperation(()=>runClientStep(options));
+  try { return await runningPromise; } finally { runningPromise=null; }
 }
 
 CS.Proxy.installProxyErrorListener(async details=>{
   try{
-    if(!details?.isProxy)return;
+    if(!details)return;
     const reason=`Proxy error: ${details.error||details.details||'Chrome reported a proxy error.'}`;
+    // Record/recover the proxy problem, but never replace the tab with a
+    // custom waiting page. Chrome should retain its normal loading/error UI.
     await lockForProxyFailure(reason);
-    // Replace a currently failing/connecting managed tab with a same-tab wait
-    // screen. No new tabs are created.
-    if(Number.isInteger(Number(details?.tabId)) && Number(details.tabId)>=0){
-      const sites=(await CS.Store.get('clientSitesCache')).clientSitesCache||[];
-      const tab=await chrome.tabs.get(Number(details.tabId)).catch(()=>null);
-      if(tab && managedUrlForSites(tab.url,sites)) await holdLoadingTab(tab.id,tab.url);
-    }
   }catch{}
 });
 
 chrome.webNavigation?.onErrorOccurred?.addListener(async details=>{
-  clearLoadingWatch(details.tabId);
   try{
     if(details.frameId!==0 || !details.url || !/^https?:\/\//i.test(details.url))return;
     const code=String(details.error||'').toUpperCase();
@@ -1398,31 +2115,45 @@ chrome.webNavigation?.onErrorOccurred?.addListener(async details=>{
     const sites=(await CS.Store.get('clientSitesCache')).clientSitesCache||[];
     if(!managedUrlForSites(details.url,sites))return;
     const reason=`Browser reported ${details.error||'a proxy connection error.'}`;
+    // Let Chrome own the navigation result. We only start background recovery.
     await beginProxyRecovery(reason);
-    await holdLoadingTab(details.tabId,details.url);
   }catch{}
 },{url:[{schemes:['http','https']}]});
 
-chrome.webNavigation?.onBeforeNavigate?.addListener(async details=>{
-  try{
-    if(details.frameId!==0 || !details.url || details.url.startsWith(chrome.runtime.getURL('')))return;
-    await applyCachedProxyImmediately();
-  }catch{}
-
-  try{
-    if(details.frameId!==0 || !details.url || details.url.startsWith(chrome.runtime.getURL('')))return;
-    const sites=await cachedManagedSites();
-    if(!managedUrlForSites(details.url,sites))return;
-    watchManagedLoadingTab(details.tabId,details.url);
-    const r=await CS.Store.get('proxyRecoveryState');
-    if(!r.proxyRecoveryState?.active)return;
-    await holdLoadingTab(details.tabId,details.url);
-  }catch{}
-},{url:[{schemes:['http','https']}]});
-
-chrome.webNavigation?.onCompleted?.addListener(details=>{
-  if(details.frameId===0)clearLoadingWatch(details.tabId);
-},{url:[{schemes:['http','https']}]});
+let proxyHealthTickPromise=null;
+async function proxyHealthTick(){
+  if(proxyHealthTickPromise)return proxyHealthTickPromise;
+  proxyHealthTickPromise=(async()=>{
+    try{
+      const s=await CS.Auth.raw().catch(()=>null);
+      if(!s?.uid)return {ok:true,loggedIn:false};
+      const state=await CS.Store.get(['lastSavedProxyConfig','proxyRecoveryState']).catch(()=>({}));
+      const recovery=state.proxyRecoveryState||{};
+      if(recovery.active===true || recovery.confirmedFailed===true){
+        if(recovery.confirmedFailed===true && recovery.active!==true){
+          await beginProxyRecovery(recovery.lastError||'Retrying proxy connection…').catch(()=>{});
+        }
+        await recoverProxyInBackground().catch(()=>{});
+        return {ok:true,recovering:true};
+      }
+      const proxy=state.lastSavedProxyConfig ? CS.Proxy.normalize(state.lastSavedProxyConfig) : {mode:'unconfigured'};
+      if(proxy.mode!=='fixed_servers')return {ok:true,proxyUnconfigured:true};
+      const health=await CS.Proxy.test(proxy,{timeoutMs:PROXY_HEALTH_TIMEOUT_MS});
+      await CS.Store.set({
+        clientProxyHealth:{...health,pending:false,checkedAt:Date.now()},
+        lastProxyHealthProxyIdentity:clientProxyIdentity(proxy)
+      }).catch(()=>{});
+      if(!health.ok){
+        await beginProxyRecovery(health.reason||'Proxy is not working.');
+        return {ok:true,proxyFailed:true,health};
+      }
+      return {ok:true,health};
+    }catch(e){
+      return {ok:false,error:String(e?.message||e||'Proxy health check failed.')};
+    }finally{proxyHealthTickPromise=null;}
+  })();
+  return proxyHealthTickPromise;
+}
 
 async function applyCachedProxyImmediately(){
   try{
@@ -1442,33 +2173,96 @@ async function applyCachedProxyImmediately(){
   }
 }
 
+
+async function applyLoggedOutNetworkLock(){
+  // Fail closed for normal web browsing while the extension is logged out.
+  // Extension pages can still communicate with the auth backend so the user
+  // can sign in again.
+  const bad=await CS.Security?.unauthorizedExtensions?.().catch(()=>[])||[];
+  await CS.Rules.applyNavigationPolicy([],{locked:true,testEnabled:false,
+    warningKind:bad.length?'extension':'device'}).catch(()=>{});
+  await CS.Proxy.clear().catch(()=>{});
+}
+
+async function enforceLoggedOutNetworkLock(){
+  await applyLoggedOutNetworkLock();
+  // Redirect managed pages away from their authenticated content without
+  // deleting the browser's last tab (which can close Chrome itself). If the
+  // managed-site cache is missing, fail closed for all existing web tabs.
+  const local=await CS.Store.get('clientSitesCache').catch(()=>({}));
+  const sites=Array.isArray(local.clientSitesCache)?local.clientSitesCache:[];
+  const tabs=await chrome.tabs.query({url:['http://*/*','https://*/*']}).catch(()=>[]);
+  const redirect=chrome.runtime.getURL('signed-out.html');
+  await Promise.all(tabs.filter(tab=>Number.isInteger(tab?.id)&&tab.id>=0)
+    .filter(tab=>!sites.length || managedUrlForSites(tab.url,sites))
+    .map(tab=>chrome.tabs.update(tab.id,{url:redirect}).catch(()=>{})));
+}
+
+async function applyStartupNetworkGate(){
+  const session=await CS.Auth.raw().catch(()=>null);
+  if(!session?.uid){
+    await applyLoggedOutNetworkLock();
+  }
+}
 async function startup(){
+  await applyStartupNetworkGate();
+  // Enforce extension policy before login, before applying any cached proxy or
+  // running the authenticated client lifecycle. No popup is required.
+  const installedSession=await CS.Auth.raw().catch(()=>null);
+  if(!installedSession?.uid){
+    const bad=await CS.Security.unauthorizedExtensions().catch(()=>[]);
+    if(bad.length){
+      await CS.Rules.applyNavigationPolicy([],{locked:true,testEnabled:false,warningKind:'extension'}).catch(()=>{});
+      await CS.Security.openPreLoginWarning().catch(()=>{});
+      return;
+    }
+  }else{
+    const scan=await CS.Security.scan([]).catch(()=>({ok:false}));
+    if(scan.locked)return;
+  }
   // Apply the last known proxy locally first. The proxy must not depend on
-  // opening the popup or on a successful Firebase round-trip.
+  // opening the popup or on a successful Supabase round-trip.
   try{await chrome.alarms?.clear?.('cookie-sync-latest-snapshot');}catch{}
   await applyCachedProxyImmediately();
   await ensureProxyHealthAlarm();
   await ensureManualShareOpenAlarm();
-
-  const scan=await CS.Security.scan((await CS.Store.get('clientSitesCache')).clientSitesCache||[]).catch(()=>({locked:false}));
-  if(scan.locked)return;
+  await ensurePresenceHeartbeatAlarm();
+  try{await chrome.alarms.clear(STATE_RECONCILIATION_ALARM);}catch{}
+  try{await chrome.alarms.clear(SUSPENSION_CHECK_ALARM);}catch{}
+  await ensureControlPlaneAlarm();
 
   const rec=(await CS.Store.get('proxyRecoveryState').catch(()=>({}))).proxyRecoveryState;
   if(rec?.active && !proxyRecoveryPromise)setTimeout(()=>recoverProxyInBackground().catch(()=>{}),0);
 
-  // Firebase/auth reconciliation remains separate from the local proxy apply.
+  // Supabase/auth reconciliation happens inside the normal client lifecycle;
+  // a recent successful proxy check can be reused immediately.
   const existingSession=await CS.Auth.raw().catch(()=>null);
   if(existingSession?.uid){
     const marker=await CS.Store.get('clientLoginSessionStartedAt').catch(()=>({}));
     if(!Number(marker.clientLoginSessionStartedAt||0)){
       await CS.Store.set({clientLoginSessionStartedAt:Date.now()}).catch(()=>{});
+      await CS.Store.remove(['clientVerifiedSyncAt','clientVerifiedSyncUid']).catch(()=>{});
     }
   }
-  await clientStep({forceProxyTest:false,freshSync:false,syncCookies:false}).catch(()=>{});
+  await clientStep({forceProxyTest:false,freshSync:false,syncCookies:false,preferCachedProxyHealth:true}).catch(()=>{});
 }
+// MV3 may terminate the worker while the popup is closed. If Chrome lost the
+// persisted alarm, re-arm it whenever any extension event wakes the worker.
+ensureControlPlaneAlarm().catch(()=>{});
 chrome.runtime.onStartup.addListener(startup);
-chrome.runtime.onInstalled.addListener(startup);
+chrome.runtime.onInstalled.addListener(async(details)=>{if(details?.reason==='install'){await CS.Store.clear().catch(()=>{});await enforceLoggedOutNetworkLock();}await startup();});
 chrome.alarms?.onAlarm?.addListener(async alarm=>{
+  if(alarm?.name===CONTROL_PLANE_ALARM){
+    const result=await controlPlaneTick().catch(e=>({ok:false,error:e?.message||String(e)}));
+    // Record the last actual background check for troubleshooting without
+    // touching the popup, cookie sync, proxy, or normal page navigation.
+    await CS.Store.set({
+      clientBackgroundAuthCheckedAt:Date.now(),
+      clientBackgroundAuthResult:result?.suspended?'suspended':result?.deviceResetRequired?'device-reset':result?.deviceBlocked?'unauthorized-device':result?.profileMissing?'profile-missing':result?.controlCheckDeferred?'deferred':result?.ok===false?'error':result?.loggedIn===false?'logged-out':'authorized'
+    }).catch(()=>{});
+    return;
+  }
+  if(alarm?.name===PRESENCE_HEARTBEAT_ALARM){await sendPresenceHeartbeat().catch(()=>{});return;}
   if(alarm?.name===MANUAL_SHARE_OPEN_ALARM){await checkManualShareOpen().catch(()=>{});return;}
   if(alarm?.name!==PROXY_HEALTH_ALARM && alarm?.name!==PROXY_ROTATION_CLEANUP_ALARM)return;
 
@@ -1494,60 +2288,279 @@ chrome.alarms?.onAlarm?.addListener(async alarm=>{
   if(r.proxyRecoveryState?.active===true || r.proxyRecoveryState?.confirmedFailed===true){
     if(r.proxyRecoveryState?.confirmedFailed===true && r.proxyRecoveryState?.active!==true) await beginProxyRecovery(r.proxyRecoveryState.lastError||'Retrying proxy connection…').catch(()=>{});
     await recoverProxyInBackground().catch(()=>{});
+    return;
+  }
+  if(alarm?.name===PROXY_HEALTH_ALARM){
+    await proxyHealthTick().catch(()=>{});
   }
 });
-chrome.management.onInstalled.addListener(async()=>{const bad=await CS.Security.unauthorizedExtensions().catch(()=>[]);if(bad.length){const s=(await CS.Store.get('clientSitesCache')).clientSitesCache||[];await CS.Security.lockdown(s,'Unauthorized Chrome extension detected').catch(()=>{});}});
-chrome.management.onEnabled.addListener(async()=>{const bad=await CS.Security.unauthorizedExtensions().catch(()=>[]);if(bad.length){const s=(await CS.Store.get('clientSitesCache')).clientSitesCache||[];await CS.Security.lockdown(s,'Unauthorized Chrome extension detected').catch(()=>{});}});
-
-async function refreshChromeForClient(options={}){
-  // Intentionally clear browser site data, but never extension storage,
-  // passwords, bookmarks, or the LogIn device/account state.
-  await chrome.browsingData.remove({}, {
-    cache: true,
-    cacheStorage: true,
-    cookies: true,
-    fileSystems: true,
-    formData: true,
-    history: true,
-    indexedDB: true,
-    localStorage: true,
-    serviceWorkers: true,
-    webSQL: true
+async function enforceNewExtensionPolicy(){
+  const bad=await CS.Security.unauthorizedExtensions().catch(()=>[]);
+  if(!bad.length)return;
+  const session=await CS.Auth.raw().catch(()=>null);
+  if(!session?.uid){
+    await CS.Rules.applyNavigationPolicy([],{locked:true,testEnabled:false,warningKind:'extension'}).catch(()=>{});
+    await CS.Security.openPreLoginWarning().catch(()=>{});
+    return;
+  }
+  await withBrowserOperation(async()=>{
+    const s=(await CS.Store.get('clientSitesCache')).clientSitesCache||[];
+    await CS.Security.lockdown(s,'Unauthorized Chrome extension detected').catch(()=>{});
   });
+}
+chrome.management.onInstalled.addListener(()=>enforceNewExtensionPolicy().catch(()=>{}));
+chrome.management.onEnabled.addListener(()=>enforceNewExtensionPolicy().catch(()=>{}));
 
-  // Refreshes clean browser data first, then restore the current shared login
-  // snapshot to the clean browser before showing the completion/welcome page.
-  let sync=null;
-  if(options.remoteAdmin || options.afterLogin){
-    for(let attempt=0;attempt<2;attempt++){
-      sync=await syncLatestCookies({fresh:true,reloadTabs:false}).catch(()=>null);
-      if(sync?.ok)break;
-      if(attempt===0)await CS.Util.sleep(350);
-    }
-  }
+// A client that is actively using Chrome must not remain authorized solely
+// because the periodic MV3 worker alarm went missing. These wake signals also
+// re-check account suspension and device revocation, throttled to once per
+// 30 seconds. The checks NEVER perform periodic cookie sync or page reloads.
+let lastActivityAuthorizationCheckAt=0;
+function onClientBrowserActivity(){
+  sendPresenceHeartbeat().catch(()=>{});
+  const now=Date.now();
+  if(now-lastActivityAuthorizationCheckAt<30000)return;
+  lastActivityAuthorizationCheckAt=now;
+  ensureControlPlaneAlarm().catch(()=>{});
+  controlPlaneTick().catch(()=>{});
+}
+chrome.tabs?.onActivated?.addListener(onClientBrowserActivity);
+chrome.webNavigation?.onCommitted?.addListener(details=>{
+  if(details?.frameId===0)onClientBrowserActivity();
+});
 
-  const targetPage = options.afterLogin
-    ? 'welcome.html'
-    : `chrome-refreshed.html${options.remoteAdmin?('?remote=1'+(options.profileRefresh?'&profile=1':'')):''}`;
-  const resetUrl = chrome.runtime.getURL(targetPage);
-  const freshTab = await chrome.tabs.create({url: resetUrl, active: true});
-  const tabs = await chrome.tabs.query({});
-  const oldTabIds = tabs
-    .filter(tab => tab.id !== freshTab.id)
-    .map(tab => tab.id)
-    .filter(id => Number.isInteger(id));
+async function verifyCurrentDeviceAuthorization(){
+  try{
+    const session=await CS.Auth.session(true).catch(()=>null);
+    const profile=await CS.Auth.cached().catch(()=>null);
+    if(!session?.uid||!session?.idToken||!profile||profile.role!=='client'||profile.active===false)return false;
 
-  if(oldTabIds.length){
-    await chrome.tabs.remove(oldTabIds).catch(()=>{});
-  }
+    const [claim,device,state]=await Promise.all([
+      CS.Firebase.getDoc(['deviceClaims',String(session.uid)],session.idToken).catch(()=>({exists:false,data:null})),
+      CS.Firebase.getDoc(['devices',String(session.uid)],session.idToken).catch(()=>({exists:false,data:null})),
+      profile.subadminUid
+        ? CS.Firebase.getDoc(['users',String(profile.subadminUid),'control','state'],session.idToken).catch(()=>({exists:false,data:null}))
+        : Promise.resolve({exists:false,data:null})
+    ]);
 
-  await chrome.tabs.update(freshTab.id,{active:true}).catch(()=>{});
-  return {ok:true,sync};
+    const identity=await CS.Crypto.deviceIdentityForAccount(
+      String(session.uid),String(claim.data?.deviceId||device.data?.deviceId||'')
+    );
+    const deviceId=String(identity?.deviceId||'');
+    if(!deviceId)return false;
+    if(!claim.exists||!device.exists)return false;
+    if(String(claim.data?.deviceId||'')!==deviceId)return false;
+    if(String(device.data?.deviceId||'')!==deviceId)return false;
+    if(String(device.data?.subadminUid||'')!==String(profile.subadminUid||''))return false;
+    if(String(device.data?.status||'')==='revoked')return false;
+
+    const controlReset=Math.max(
+      Number(state.data?.resetVersion||0),
+      Number(profile.deviceResetVersion||0)
+    );
+    if(Number(device.data?.lastResetVersion||0)<controlReset)return false;
+
+    return true;
+  }catch{return false;}
 }
 
+// Stage only the current, assigned and decryptable snapshots before the login
+// cleanup. A second Supabase fetch after browsingData.remove() is not reliable
+// enough to be the only chance to restore website cookies.
+async function stageAuthorizedLoginSnapshots(){
+  const me=await CS.Auth.currentProfile(true);
+  if(!me?.session?.uid || me.profile?.role!=='client' || me.profile?.active===false)return [];
+  const sites=await loadSites(me,{force:true});
+  if(!sites.length)return [];
+  const key=await getSyncKey(me);
+  if(!key)return [];
+  const staged=[];
+  for(const site of sites){
+    try{
+      const latest=await CS.Firebase.getDoc(['sites',site.id,'sync','latest'],me.session.idToken);
+      if(!latest.exists || !latest.data?.envelope || typeof latest.data.envelope!=='object')continue;
+      const payload=await CS.Crypto.decryptWithKey(latest.data.envelope,key);
+      if(String(payload?.siteId)!==String(site.id) || !Array.isArray(payload.cookies))continue;
+      staged.push({site,cookies:payload.cookies,version:Number(latest.data.version||0)});
+    }catch{} // Still fall back to the existing post-cleanup fetch/retry path.
+  }
+  return staged;
+}
+
+async function restoreStagedLoginSnapshots(staged){
+  const diagnostics=[];
+  let applied=0,cookieFailures=0;
+  for(const item of Array.isArray(staged)?staged:[]){
+    try{
+      const r=await CS.Cookies.reconcile(item.site,item.cookies);
+      const failed=Number(r.failed||0);
+      cookieFailures+=failed;
+      // An empty snapshot must not count as a restored login session.
+      const ok=!failed && item.cookies.length>0 && Number(r.set||0)>=item.cookies.length;
+      if(ok)applied++;
+      diagnostics.push({siteId:item.site.id,hostname:item.site.hostname,
+        status:failed || (item.cookies.length>0 && Number(r.set||0)<item.cookies.length)?'partial':ok?'applied':'missing',version:item.version,
+        cookies:item.cookies.length,cookiesSet:Number(r.set||0),cookiesFailed:failed});
+    }catch(e){
+      cookieFailures++;
+      diagnostics.push({siteId:item.site.id,hostname:item.site.hostname,
+        status:'invalid-snapshot',error:String(e?.message||e)});
+    }
+  }
+  return {ok:true,applied,cookieFailures,syncDiagnostics:diagnostics};
+}
+
+// A login is complete only when EVERY assigned website has a non-empty,
+// successfully written snapshot. A single restored site is not enough.
+function loginCookiesFullyRestored(sync, assignedSites){
+  if(!sync?.ok || sync.error || sync.suspended || sync.locked || sync.deviceBlocked || sync.needsPermission ||
+     Number(sync.cookieFailures||0)>0)return false;
+  const expected=Array.isArray(assignedSites)?assignedSites:[];
+  const diagnostics=Array.isArray(sync.syncDiagnostics)?sync.syncDiagnostics:[];
+  if(!expected.length || !diagnostics.length)return false;
+  return expected.every(site=>diagnostics.some(d=>
+    String(d.siteId)===String(site.id) && d.status==='applied' &&
+    Number(d.cookies||0)>0 && Number(d.cookiesSet||0)>=Number(d.cookies||0) &&
+    Number(d.cookiesFailed||0)===0
+  ));
+}
+
+// The pre-cleanup staging path used to apply cookies successfully but NEVER
+// recorded a sync time. Persist once the complete login restoration succeeds,
+// using the exact account/device already authorized by clientStep.
+async function recordCompletedLoginCookieSync(sync, options){
+  const me=await CS.Auth.currentProfile(false);
+  if(!me?.session?.uid || me.profile?.role!=='client')throw new Error('Login authorization was lost during cookie restoration.');
+  const uid=String(me.session.uid);
+  const now=CS.Util.now();
+  const prior=options.authorizedDevice || sync.device || {};
+  const bySite={...(prior.lastSyncVersionBySite||{})};
+  let version=Number(prior.lastSyncVersion||0);
+  for(const d of sync.syncDiagnostics||[]){
+    if(d.status!=='applied')continue;
+    bySite[d.siteId]=Number(d.version||0);
+    version=Math.max(version,Number(d.version||0));
+  }
+  const device={...prior,lastSyncAt:now,lastSyncVersion:version,lastSyncVersionBySite:bySite};
+  // Store the verified timestamp independently: a later proxy-health response
+  // may contain older device telemetry and must not erase a real login sync.
+  await CS.Store.set({
+    clientVerifiedSyncUid:uid,clientVerifiedSyncAt:now,
+    clientLastState:{
+      ip:device.lastIp||'',lastSyncAt:now,
+      proxyHealthy:device.proxyHealthy===true,
+      applied:sync.applied,cookieFailures:0,syncDiagnostics:sync.syncDiagnostics
+    }
+  });
+  // Keep the backend Last sync consistent with manual Fresh Sync. Use the
+  // CURRENT device document, not a stale deferred-proxy state, so we never
+  // overwrite a newer reset, claim, proxy status, or IP with old telemetry.
+  try{
+    const remote=await CS.Firebase.getDoc(['devices',uid],me.session.idToken);
+    if(remote?.exists && remote.data && String(remote.data.deviceId||'')===String(device.deviceId||'') &&
+       String(remote.data.subadminUid||'')===String(me.profile.subadminUid||'') &&
+       String(remote.data.status||'')!=='revoked'){
+      const current=remote.data;
+      const remoteVersions={...(current.lastSyncVersionBySite||{}),...bySite};
+      await CS.Firebase.setDoc(['devices',uid],{
+        ...current,lastSyncAt:now,
+        lastSyncVersion:Math.max(Number(current.lastSyncVersion||0),version),
+        lastSyncVersionBySite:remoteVersions
+      },me.session.idToken);
+    }
+  }catch{} // Local verified timestamp is authoritative until telemetry recovers.
+  return {...sync,device,lastSyncAt:now};
+}
+
+async function refreshChromeForClientUnlocked(options={}){
+  // Match the older working client: obtain the authorized snapshot BEFORE
+  // clearing Chrome, so restoring login cookies never depends on fetching a
+  // second copy immediately after a destructive browser reset.
+  // Keep decrypted snapshots only in this service-worker invocation's memory.
+  let stagedLoginSnapshots=[];
+  if(options.afterLogin){
+    stagedLoginSnapshots=await stageAuthorizedLoginSnapshots().catch(()=>[]);
+    await CS.Cookies.clearAllBrowserData();
+  }else{
+    await chrome.browsingData.remove({}, {
+      cache:true,cacheStorage:true,cookies:true,fileSystems:true,formData:true,
+      history:true,indexedDB:true,localStorage:true,serviceWorkers:true,webSQL:true
+    });
+  }
+
+  let sync=null;
+  if(options.afterLogin){
+    // Restore the pre-cleared snapshot first; this is the direct equivalent of
+    // the successful legacy login's first Fresh Sync, but after full cleanup.
+    if(stagedLoginSnapshots.length){
+      sync=await restoreStagedLoginSnapshots(stagedLoginSnapshots);
+    }
+    const stagedComplete=sync?.applied>0 && Number(sync.cookieFailures||0)===0 &&
+      (sync.syncDiagnostics||[]).every(d=>d.status==='applied');
+
+    // If nothing was staged or one snapshot was incomplete, fall back to the
+    // same Fresh Sync API used by the existing manual button. Never require
+    // every assigned website to have a snapshot before allowing sign-in;
+    // the legacy working client did not have this extra login-only gate.
+    if(!stagedComplete){
+      for(let attempt=0;attempt<2;attempt++){
+        let current;
+        try{
+          current=await syncLatestCookiesUnlocked({fresh:true,reloadTabs:false});
+        }catch(e){
+          if(String(e?.code||'')==='DEVICE_RESET_PENDING')throw e;
+          current={ok:false,error:e?.message||String(e)};
+        }
+        if(current?.suspended || current?.locked || current?.deviceBlocked){
+          return{ok:false,sync:current,error:current.error||'Account authorization was withdrawn.'};
+        }
+        // Keep successfully restored cookies even if a later remote fetch
+        // fails; never turn a good staged result into a false login error.
+        if(!sync || Number(current?.applied||0)>=Number(sync?.applied||0))sync=current;
+        if(current?.ok && Number(current.applied||0)>0)break;
+        if(attempt===0)await CS.Util.sleep(350);
+      }
+    }
+
+    if(Number(sync?.applied||0)>0 && (sync.syncDiagnostics||[]).some(d=>
+      d.status==='applied' && Number(d.cookiesSet||0)>0 && Number(d.cookiesFailed||0)===0)){
+      // Record a real cookie write, never a merely non-empty server response.
+      // This also keeps Last sync visible when a newer health check returns
+      // stale device telemetry. Device/reset and proxy fields are preserved.
+      sync=await recordCompletedLoginCookieSync(sync,options);
+    }
+    // Missing/partial cookies are sync problems, not invalid credentials.
+    // Preserve the older working behavior: allow the authorized session and
+    // welcome page, with a truthful retry/partial status if needed.
+    if(!sync)sync={ok:false,applied:0,error:'No shared login snapshot was available.'};
+  }else if(options.remoteAdmin || options.manualFix){
+    sync=await syncLatestCookiesUnlocked({fresh:true,reloadTabs:false,existingDeviceOnly:options.existingDeviceOnly===true});
+  }
+
+  const targetPage=options.afterLogin?'welcome.html':'chrome-refreshed.html';
+  const params=new URLSearchParams();
+  if(options.remoteAdmin)params.set('remote','1');
+  if(options.profileRefresh)params.set('profile','1');
+  if(options.afterLogin)params.set('autosync','1');
+  else if(options.remoteAdmin || options.manualFix)params.set('sync',CS.Recovery.syncStatus(sync));
+  const query=params.toString();
+  const resetUrl=chrome.runtime.getURL(targetPage+(query?'?'+query:''));
+  const freshTab=await chrome.tabs.create({url:resetUrl,active:true});
+  const tabs=await chrome.tabs.query({});
+  const oldTabIds=tabs.filter(tab=>tab.id!==freshTab.id).map(tab=>tab.id).filter(id=>Number.isInteger(id));
+  if(oldTabIds.length)await chrome.tabs.remove(oldTabIds).catch(()=>{});
+  await chrome.tabs.update(freshTab.id,{active:true}).catch(()=>{});
+  return{ok:true,sync};
+}
+
+async function refreshChromeForClient(options={}){
+  return withBrowserOperation(()=>refreshChromeForClientUnlocked(options));
+}
 chrome.runtime.onMessage.addListener((msg,sender,sendResponse)=>{(async()=>{
-  if(msg.type==='fix-chrome')return await refreshChromeForClient();
-  if(msg.type==='bootstrap')return{ok:true,...await cachedState()};
+  if(msg.type==='popup-open') return await runForegroundChecks();
+  if(msg.type==='fix-chrome')return await refreshChromeForClient({manualFix:true});
+  if(msg.type==='bootstrap'){const suspension=await checkClientSuspension({enforce:true}).catch(()=>null);if(suspension?.suspended)return{ok:true,...await cachedState(),suspended:true};return{ok:true,...await cachedState()};}
+  if(msg.type==='activate-suspension'){return await activateSuspensionImmediately(msg.reason||'Account suspended.').catch(()=>({ok:false,suspended:true}));}
   if(msg.type==='proxy-wait-status'){
     const r=await CS.Store.get(['proxyRecoveryState','clientProxyHealth']);
     const rec=r.proxyRecoveryState||{active:false,confirmedFailed:false};
@@ -1560,64 +2573,129 @@ chrome.runtime.onMessage.addListener((msg,sender,sendResponse)=>{(async()=>{
     await beginProxyRecovery('Retrying proxy connection…');
     return{ok:true};
   }
-  if(msg.type==='resume') return await clientStep({forceProxyTest:false,freshSync:false,deferProxyTest:true,allowDeviceReset:msg.allowDeviceReset===true,forceSites:true});
-  if(msg.type==='device-gate') return await clientStep({forceProxyTest:false,freshSync:false,deferProxyTest:true,allowDeviceReset:msg.allowDeviceReset===true,forceSites:true});
+  if(msg.type==='resume') return await clientStep({forceProxyTest:false,freshSync:false,deferProxyTest:true,allowDeviceReset:msg.allowDeviceReset===true,forceSites:true,preferCachedProxyHealth:true});
+  if(msg.type==='device-gate') return await clientStep({forceProxyTest:false,freshSync:false,deferProxyTest:false,allowDeviceReset:msg.allowDeviceReset===true,forceSites:true,preferCachedProxyHealth:true});
   if(msg.type==='reauthorize-device') return await clientStep({forceProxyTest:true,freshSync:false,deferProxyTest:false,allowDeviceReset:true});
-  if(msg.type==='check-proxy') return await clientStep({forceProxyTest:true,freshSync:false,deferProxyTest:false,allowDeviceReset:true,syncCookies:false});
+  // A proxy health check is background-only and must never re-claim a device
+  // after Admin Reset Device. Only explicit login/reauthorize actions may pass
+  // allowDeviceReset:true.
+  if(msg.type==='check-proxy') return await clientStep({forceProxyTest:true,freshSync:false,deferProxyTest:false,allowDeviceReset:false,syncCookies:false});
   if(msg.type==='login'){
+    clientLoginInProgress=true;
     try{
       const r=await CS.Auth.login(msg.email,msg.password,['client']);
+      // A successful login must restore background enforcement even when the
+      // browser/Chrome profile silently discarded its previous alarm.
+      await ensureControlPlaneAlarm();
       await CS.Store.set({clientLoginSessionStartedAt:Date.now()}).catch(()=>{});
-      // During explicit login, suppress the one-time registration welcome inside
-      // clientStep. If this is genuinely a NEW Chrome device, the full browser
-      // cleanup runs exactly once below and the existing welcome page is shown.
-      // Existing authorized devices do NOT get cleaned/refreshed on every login.
-      const state=await clientStep({forceProxyTest:false,freshSync:false,deferProxyTest:true,forceSites:true,suppressFirstWelcome:true});
-      if(state.suspended||state.deviceBlocked||state.locked||state.waitingForSite) return state;
+      await CS.Store.remove(['clientVerifiedSyncAt','clientVerifiedSyncUid']).catch(()=>{});
+      // Suppress the one-time device-registration welcome in clientStep:
+      // every authorized login will open ONE welcome page after full cleanup.
+      const state=await clientStep({forceProxyTest:false,freshSync:false,deferProxyTest:true,allowDeviceReset:true,forceSites:true,suppressFirstWelcome:true,syncCookies:false});
+      // Never wipe Chrome or reopen managed sites for suspended, revoked,
+      // locked, or otherwise unsuccessful authorization checks.
+      if(state.suspended||state.deviceBlocked||state.locked||state.waitingForSite||state.ok!==true||state.loggedIn!==true) return state;
 
-      if(state?.newlyRegistered===true){
-        const refreshed=await refreshChromeForClient({afterLogin:true}).catch(()=>({ok:false,sync:null}));
-        if(!refreshed?.ok) throw new Error('Chrome could not be refreshed. Please try signing in again.');
-        return{
-          ok:true,
-          profile:r.profile,
-          ...state,
-          ...(refreshed.sync||{}),
-          proxy:state.proxy,
-          health:state.health,
-          proxyChecking:state.proxyChecking,
-          loggedIn:true,
-          loginBrowserRefreshed:true,
-          newlyRegistered:true
-        };
-      }
-
+      // Only a fully authorized login releases the persistent logout gate.
+      await CS.Store.remove('clientSignedOut');
+      await CS.Rules.applyNavigationPolicy(state.sites||[],{locked:false,testEnabled:false});
+      const refreshed=await refreshChromeForClient({afterLogin:true,authorizedSites:state.sites||[],authorizedDevice:state.device||null}).catch(e=>({ok:false,error:e?.message||String(e)}));
+      if(!refreshed?.ok) throw new Error(refreshed?.error||'Chrome could not be refreshed. Please try signing in again.');
       return{
         ok:true,
         profile:r.profile,
         ...state,
+        ...(refreshed.sync||{}),
+        proxy:state.proxy,
+        health:state.health,
+        proxyChecking:state.proxyChecking,
         loggedIn:true,
-        loginBrowserRefreshed:false,
-        newlyRegistered:false
+        loginBrowserRefreshed:true,
+        newlyRegistered:state.newlyRegistered===true
       };
     }catch(e){
+      await CS.Store.set({clientSignedOut:true}).catch(()=>{});
       await CS.Auth.logout().catch(()=>{});
+      await enforceLoggedOutNetworkLock().catch(()=>{});
       throw e;
+    }finally{
+      clientLoginInProgress=false;
     }
   }
   if(msg.type==='logout'){
-  const sites=(await CS.Store.get('clientSitesCache')).clientSitesCache||[];
+  await CS.Store.remove(['clientVerifiedSyncAt','clientVerifiedSyncUid']).catch(()=>{});
   const me=await CS.Auth.cached().catch(()=>null);
-  await CS.Proxy.clear().catch(()=>{});
-  await CS.Rules.applyNavigationPolicy(sites,{locked:true});
+  // Persist a signed-out gate and remove the session BEFORE touching tabs,
+  // network, proxy or browsing data. Even if Chrome exits mid-cleanup, the
+  // next startup must not restore the old login.
+  await CS.Store.set({clientSignedOut:true});
   await CS.Auth.logout();
-  const keys=['clientSitesCache','clientSitesCacheAt','clientSitesCacheSubadminUid','clientSubStatusCache','clientSubStatusCacheAt','clientSubStatusCacheSubadminUid','clientControlCache','clientControlCacheAt','clientControlCacheSubadminUid','clientLastState','clientProxyHealth','clientLockReason','clientSuspendedReason','lastSavedProxyConfig','lastSavedProxyConfigAt','lastSavedProxySubadminUid','clientDeviceCache','clientDeviceCacheAt','clientDeviceCacheUid','proxyRecoveryState','clientLoginSessionStartedAt'];
+  await enforceLoggedOutNetworkLock();
+  await CS.Proxy.clear().catch(()=>{});
+  // Clear website logins too, not only the extension's auth token. Preserve
+  // the reinstall-safe device marker so logging out does NOT reset device
+  // ownership or bypass the single-device rule.
+  let cleanupError='';
+  try{await withBrowserOperation(()=>CS.Cookies.clearAllBrowserData());}
+  catch(e){cleanupError=String(e?.message||e||'Chrome browsing-data cleanup failed.');}
+  const keys=['clientSitesCache','clientSitesCacheAt','clientSitesCacheSubadminUid','clientSubStatusCache','clientSubStatusCacheAt','clientSubStatusCacheSubadminUid','clientControlCache','clientControlCacheAt','clientControlCacheSubadminUid','clientLastState','clientProxyHealth','clientLockReason','clientSuspendedReason','lastSavedProxyConfig','lastSavedProxyConfigAt','lastSavedProxySubadminUid','clientDeviceCache','clientDeviceCacheAt','clientDeviceCacheUid','clientPresenceLastSentAt','proxyRecoveryState','lastProxyRotationSignalVersion','lastProxyRotationSignalSubadminUid','clientLoginSessionStartedAt'];
   if(me?.subadminUid)keys.push(`syncGroupKey:${me.subadminUid}`);
   await CS.Store.remove(keys);
-  return{ok:true};
+  return cleanupError?{ok:false,signedOut:true,error:`Signed out, but Chrome could not fully clear website data: ${cleanupError}`}:{ok:true,signedOut:true};
 }
-  if(msg.type==='refresh')return clientStep({forceProxyTest:false,freshSync:false,forceSites:true});
+  if(msg.type==='refresh')return clientStep({forceProxyTest:false,freshSync:false,forceSites:true,preferCachedProxyHealth:true});
+  if(msg.type==='auto-sync-after-login'){
+    // The welcome page may request exactly one follow-up Fresh Sync per
+    // authorized login. A page refresh must not cause ongoing cookie polling.
+    const [local,session]=await Promise.all([
+      CS.Store.get(['clientLoginSessionStartedAt','clientWelcomeAutoSyncAttemptedAt','clientSignedOut']).catch(()=>({})),
+      CS.Auth.raw().catch(()=>null)
+    ]);
+    const started=Number(local.clientLoginSessionStartedAt||0);
+    if(!session?.uid || local.clientSignedOut===true || !started ||
+       Date.now()-started>120000 ||
+       Number(local.clientWelcomeAutoSyncAttemptedAt||0)>=started){
+      return{ok:true,skipped:true};
+    }
+    await CS.Store.set({clientWelcomeAutoSyncAttemptedAt:started});
+    // Same function/options as the user's working LogIn Website button.
+    return syncLatestCookies({fresh:true});
+  }
   if(msg.type==='fresh-sync')return syncLatestCookies({fresh:true});
-  if(msg.type==='warning-check')return CS.Security.recheck((await CS.Store.get('clientSitesCache')).clientSitesCache||[]);
+  if(msg.type==='warning-check'){
+    const stored=await CS.Store.get(['clientSitesCache','warningKind']).catch(()=>({}));
+    const sites=stored.clientSitesCache||[];
+    const warningKind=String(stored.warningKind||'extension');
+    if(warningKind==='device'){
+      const binding=await getDeviceBinding().catch(()=>null);
+      const session=await CS.Auth.raw().catch(()=>null);
+      let resetPending=false;
+      if(session?.uid&&binding?.uid===String(session.uid)&&binding?.deviceId){
+        try{
+          const profile=await CS.Firebase.getDoc(['users',String(session.uid)],session.idToken);
+          const resetVersion=Number(profile?.data?.deviceResetVersion||0);
+          resetPending=resetVersion>Number(binding.resetVersion||0);
+        }catch{}
+      }
+      if(resetPending){
+        const state=await clientStep({forceProxyTest:false,freshSync:false,deferProxyTest:true,allowDeviceReset:true,forceSites:true,suppressFirstWelcome:true});
+        if(state?.ok&&state?.loggedIn&&!state?.deviceBlocked)return state;
+      }
+      const authorized=await verifyCurrentDeviceAuthorization();
+      if(!authorized)return{ok:false,deviceUnauthorized:true};
+    }
+    // A user who removes the offending extension before ever signing in
+    // must remain blocked. The old recheck() could release the browser with
+    // an empty site cache even when no authenticated session existed.
+    const session=await CS.Auth.raw().catch(()=>null);
+    if(!session?.uid){
+      const bad=await CS.Security.unauthorizedExtensions().catch(()=>[]);
+      if(bad.length)return {ok:false,locked:true};
+      await CS.Security.clearWarningTab().catch(()=>{});
+      await applyLoggedOutNetworkLock();
+      return {ok:true,loggedIn:false};
+    }
+    return CS.Security.recheck(sites);
+  }
   throw new Error('Unknown command.');
 })().then(r=>sendResponse(r)).catch(e=>sendResponse({ok:false,error:e?.message||String(e)}));return true;});

@@ -1,692 +1,412 @@
-:root{--p:#4f46e5;--p2:#7c3aed;--bg:#f5f7fb;--card:#fff;--text:#172033;--muted:#667085;--line:#e5e7ef;--good:#16a34a;--bad:#dc2626;--warn:#d97706}*{box-sizing:border-box}html{width:410px;min-width:410px;max-width:410px;background:var(--bg)}body{margin:0;overflow-x:hidden;width:410px;min-width:410px;max-width:410px;min-height:540px;background:var(--bg);font-family:Inter,system-ui,-apple-system,"Segoe UI",sans-serif;color:var(--text);font-size:12px}.hidden{display:none!important}.screen{min-height:540px;padding:15px;display:grid;place-items:center}.panel{width:100%;background:#fff;border:1px solid var(--line);border-radius:18px;box-shadow:0 18px 50px rgba(15,23,42,.1);padding:20px}.login-panel{max-width:370px}.center{text-align:center}.logo,.mini-logo{display:grid;place-items:center;color:#fff;background:linear-gradient(135deg,var(--p),var(--p2));box-shadow:0 10px 22px rgba(79,70,229,.22)}.logo{width:48px;height:48px;border-radius:15px;margin:0 auto 12px;font-size:24px;font-weight:900}.mini-logo{width:35px;height:35px;border-radius:10px}.brand{display:flex;align-items:center;gap:8px}.brand strong{display:block;font-size:13px}.brand small{display:block;font-size:9px;color:var(--muted);margin-top:2px}.topbar{display:flex;justify-content:space-between;align-items:center;padding:12px 13px}.icon-btn{width:33px;height:33px;border:1px solid var(--line);background:#fff;border-radius:10px;color:#667085}.card{margin:8px 9px;background:#fff;border:1px solid var(--line);border-radius:15px;box-shadow:0 7px 20px rgba(15,23,42,.05)}.status-card{padding:12px 13px}.status-line{display:flex;align-items:center;justify-content:space-between;gap:10px}.card-head{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;padding:12px 13px 6px}.card-body{padding:0 13px 13px}.eyebrow{font-size:8px;font-weight:900;letter-spacing:.09em;text-transform:uppercase;color:#7b8190}.eyebrow.red{color:#b42318}.card h2{font-size:14px;margin:3px 0 0;font-weight:900}.account-email{display:block;margin-top:3px;font-size:9px;line-height:1.35;color:#98a2b3;font-weight:500;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.panel h1{font-size:18px;margin:0 0 4px;font-weight:900}.panel p{margin:0;color:var(--muted);font-size:10px;line-height:1.5}.badge{display:inline-flex;align-items:center;gap:5px;padding:5px 8px;border-radius:999px;font-size:8px;font-weight:900}.badge.good{background:#dcfce7;color:#166534}.badge.warn{background:#ffedd5;color:#9a3412}.badge.bad{background:#fee2e2;color:#991b1b}.dot{width:6px;height:6px;border-radius:50%;background:currentColor}.kv{display:flex;justify-content:space-between;gap:8px;padding:7px 0;border-bottom:1px solid #f0f2f5;font-size:10px}.kv:last-child{border-bottom:0}.kv span{color:var(--muted)}.kv strong{text-align:right;max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.alert{padding:9px 10px;border-radius:10px;font-size:9px;line-height:1.45}.alert.info{background:#eff6ff;border:1px solid #bfdbfe;color:#1e40af}.alert.bad{background:#fef2f2;border:1px solid #fecaca;color:#991b1b}label{font-size:9px;font-weight:800;color:#475467;display:block;margin:4px 0}.input,input{width:100%;border:1px solid var(--line);background:#fff;padding:9px 10px;border-radius:10px;outline:0;font:inherit;color:var(--text);margin-bottom:8px}input:focus{border-color:#a5b4fc;box-shadow:0 0 0 3px rgba(99,102,241,.12)}.btn{border:0;border-radius:10px;padding:9px 11px;font:inherit;font-weight:850;cursor:pointer}.primary{background:linear-gradient(135deg,var(--p),var(--p2));color:#fff}.light{background:#fff;border:1px solid var(--line);color:#344054}.wide{width:100%}.btn:disabled{opacity:.55;cursor:wait}.small{font-size:9px;color:#98a2b3;margin-top:7px;line-height:1.45}.footer{text-align:center;color:#98a2b3;font-size:8px;padding:8px 10px 13px}.spinner{width:16px;height:16px;border:2px solid currentColor;border-right-color:transparent;border-radius:50%;display:inline-block;animation:spin .7s linear infinite}.purple{color:var(--p);margin-top:13px}.suspend-icon{width:58px;height:58px;margin:0 auto 12px;border-radius:18px;background:#fee2e2;color:#b42318;display:grid;place-items:center;font-size:27px;font-weight:900}.suspend-title{color:#991b1b!important;margin-top:5px!important}.sites-list{margin-top:8px;display:flex;flex-direction:column;gap:6px}.site-pill{padding:8px 9px;border:1px solid var(--line);border-radius:10px;background:#fafbfc;font-size:10px;display:flex;justify-content:space-between;gap:8px}.site-pill span{color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.toast{position:fixed;left:14px;right:14px;bottom:12px;padding:10px;border-radius:10px;color:#fff;background:#172033;box-shadow:0 16px 34px rgba(15,23,42,.24);font-size:10px;z-index:100}
-
-/* Shared Login Access visual polish */
-.login-card .brand-mark{
-  position:relative;
-  box-shadow:
-    0 14px 35px rgba(91,69,232,.24),
-    0 0 0 6px rgba(91,69,232,.035),
-    0 0 28px rgba(91,69,232,.13);
+/* LogIn client popup — light, quiet, precise.
+   Visual only. Every id, class, and JS state hook is preserved. */
+:root{
+  --bg:#f5f5f7;
+  --surface:#ffffff;
+  --surface-2:#f5f5f7;
+  --text:#1d1d1f;
+  --muted:#6e6e73;
+  --faint:#86868b;
+  --line:rgba(0,0,0,.08);
+  --line-strong:rgba(0,0,0,.12);
+  --accent:#0071e3;
+  --accent-hover:#0077ed;
+  --accent-press:#0066cc;
+  --accent-soft:rgba(0,113,227,.14);
+  --good:#1d7f37;
+  --good-bg:#e8f7ec;
+  --bad:#d70015;
+  --bad-bg:#fff1f0;
+  --bad-line:rgba(215,0,21,.16);
+  --warn:#9a5b00;
+  --warn-bg:#fff6e8;
+  --info:#0066cc;
+  --info-bg:#f3f8fd;
+  --info-line:rgba(0,113,227,.16);
+  --shadow:0 1px 1px rgba(0,0,0,.04);
+  --radius:16px;
+  --radius-sm:12px;
+  --font:-apple-system,BlinkMacSystemFont,"SF Pro Text","SF Pro Display","Segoe UI",system-ui,sans-serif;
+  --ease:cubic-bezier(.2,.8,.2,1);
 }
+*{box-sizing:border-box}
+html{
+  width:410px;min-width:410px;max-width:410px;
+  background:var(--bg);
+  color-scheme:light;
+}
+body{
+  margin:0;
+  width:410px;min-width:410px;max-width:410px;
+  min-height:540px;
+  background:var(--bg);
+  color:var(--text);
+  font-family:var(--font);
+  font-size:13px;
+  line-height:1.45;
+  -webkit-font-smoothing:antialiased;
+  text-rendering:optimizeLegibility;
+  overflow-x:hidden;
+}
+button,input,select{font:inherit;color:inherit}
+button{appearance:none;-webkit-appearance:none}
+button:not(:disabled),a.btn,[role="button"]{cursor:pointer}
+.hidden{display:none!important}
+.ui-hook{display:none!important}
+#app #syncInfo{display:none!important}
+#app .proxy-endpoint-row{display:none!important}
+
+/* Scrollbar — thin, quiet, visible on intent */
+html,body{
+  overflow-y:auto;
+  scrollbar-width:thin;
+  scrollbar-color:transparent transparent;
+}
+html:hover,body:hover,html.scrollbar-active,body.scrollbar-active{scrollbar-color:rgba(0,0,0,.28) transparent}
+html::-webkit-scrollbar,body::-webkit-scrollbar{width:8px;height:8px}
+html::-webkit-scrollbar-track,body::-webkit-scrollbar-track{background:transparent}
+html::-webkit-scrollbar-thumb,body::-webkit-scrollbar-thumb{
+  background:transparent;border:2px solid transparent;border-radius:999px;background-clip:padding-box;min-height:28px;
+}
+html:hover::-webkit-scrollbar-thumb,body:hover::-webkit-scrollbar-thumb,
+html.scrollbar-active::-webkit-scrollbar-thumb,body.scrollbar-active::-webkit-scrollbar-thumb{background:rgba(0,0,0,.28)}
+html::-webkit-scrollbar-button,body::-webkit-scrollbar-button{display:none;width:0;height:0}
+html:has(#login.screen:not(.hidden)),
+body:has(#login.screen:not(.hidden)){scrollbar-width:none}
+html:has(#login.screen:not(.hidden))::-webkit-scrollbar,
+body:has(#login.screen:not(.hidden))::-webkit-scrollbar{width:0;height:0;display:none}
+
+/* Screens */
+.screen{
+  min-height:540px;
+  display:grid;
+  place-items:center;
+  padding:28px 22px 72px;
+}
+#login.screen.hidden,#app.hidden,.screen.hidden{display:none!important}
+#login.screen:not(.hidden){
+  display:grid!important;
+  place-items:center;
+  min-height:540px;
+  padding:36px 22px 78px;
+}
+.panel,.state-card{
+  width:100%;
+  max-width:366px;
+  background:var(--surface);
+  border:1px solid var(--line);
+  border-radius:22px;
+  padding:28px 24px 24px;
+  text-align:center;
+  box-shadow:var(--shadow);
+}
+.center{text-align:center}
+.panel h1,.state-card h1{
+  margin:10px 0 6px;
+  font-size:22px;
+  font-weight:650;
+  letter-spacing:-.022em;
+  line-height:1.15;
+}
+.panel p,.state-card p{margin:0;color:var(--muted);font-size:13px;line-height:1.5}
+
+.logo,.mini-logo,.brand-mark{
+  display:grid;place-items:center;
+  color:#fff;
+  background:var(--accent);
+  font-weight:600;
+  box-shadow:none;
+}
+.brand-mark,.logo{
+  width:52px;height:52px;margin:0 auto;
+  border-radius:16px;
+  font-size:24px;
+  position:relative;
+}
+.mini-logo{width:36px;height:36px;border-radius:11px;font-size:18px;flex:0 0 36px}
 .login-card .brand-mark::after{
   content:"";
   position:absolute;
-  right:-3px;
-  bottom:-3px;
-  width:11px;
-  height:11px;
-  border-radius:50%;
-  background:#12b76a;
+  right:-2px;bottom:-2px;
+  width:10px;height:10px;border-radius:50%;
+  background:#30d158;
   border:2px solid #fff;
-  box-shadow:
-    0 0 0 0 rgba(18,183,106,.25),
-    0 0 9px rgba(18,183,106,.28);
-  animation:loginOnlinePulse10627 2s ease-in-out infinite;
 }
-@keyframes loginOnlinePulse10627{
-  0%,100%{
-    box-shadow:
-      0 0 0 0 rgba(18,183,106,.22),
-      0 0 8px rgba(18,183,106,.22);
-  }
-  50%{
-    box-shadow:
-      0 0 0 5px rgba(18,183,106,0),
-      0 0 14px rgba(18,183,106,.38);
-  }
-}
-
-
-/* Secure Login — match LogIn Admin Space design exactly.
-   UI-only: no client behavior or JS hooks changed. */
-#login.screen{
-  min-height:0;
-  display:grid;
-  place-items:start center;
-  padding:18px 20px 20px;
-}
-#login .state-card{
-  width:min(100%,390px);
-  background:#fff;
-  border:1px solid #e5e7eb;
-  border-radius:24px;
-  padding:30px;
-  text-align:center;
-  box-shadow:0 12px 30px rgba(16,24,40,.08);
-}
-#login .brand-mark{
-  width:68px;
-  height:68px;
-  margin:0 auto;
-  border-radius:20px;
-  display:grid;
-  place-items:center;
-  color:#fff;
-  font-size:32px;
-  font-weight:700;
-  background:linear-gradient(135deg,#5b45e8,#7440ee);
-  box-shadow:0 14px 35px rgba(91,69,232,.24);
-}
-#login .eyebrow{
+.eyebrow{
   display:inline-block;
-  margin-top:20px;
-  font-size:10px;
-  font-weight:800;
-  letter-spacing:.12em;
+  margin-top:16px;
+  font-size:11px;
+  font-weight:600;
+  letter-spacing:.08em;
   text-transform:uppercase;
-  color:#667085;
+  color:var(--faint);
 }
-#login .state-card h1{
-  margin:12px 0 7px;
-  font-size:25px;
-  line-height:1.15;
-  letter-spacing:-.02em;
-  font-weight:800;
+.eyebrow.red{color:var(--bad)}
+.suspend-title{color:var(--bad)!important;font-size:20px!important;letter-spacing:-.02em}
+.suspend-icon,.warn-icon{
+  width:52px;height:52px;margin:0 auto 4px;
+  border-radius:16px;
+  display:grid;place-items:center;
+  font-size:22px;font-weight:650;
 }
-#login .state-card p{
-  margin:0;
-  color:#667085;
-  line-height:1.6;
-  font-size:13px;
-}
-#login .form-stack{
-  display:grid;
-  gap:14px;
-  margin-top:14px;
-  text-align:left;
-}
-#login .field{min-width:0}
-#login .field label{
+.suspend-icon{background:var(--bad-bg);color:var(--bad)}
+.warn-icon{background:var(--warn-bg);color:var(--warn)}
+
+.form-stack{display:grid;gap:12px;margin-top:22px;text-align:left}
+.field{min-width:0}
+.field label,label{
   display:block;
-  margin:0 0 7px;
+  margin:0 0 6px;
   font-size:12px;
-  font-weight:800;
-  color:#344054;
+  font-weight:590;
+  color:var(--text);
 }
-#login .field input{
+.input,input,select{
   width:100%;
-  min-height:48px;
-  margin:0;
-  border:1px solid #d9dee8;
-  background:#fff;
-  border-radius:14px;
-  padding:12px 14px;
-  outline:0;
-  font:inherit;
-  font-size:13px;
-  color:#172033;
-  box-shadow:none;
-}
-#login .field input::placeholder{color:#98a2b3}
-#login .field input:focus{
-  border-color:#a59bf4;
-  box-shadow:0 0 0 3px rgba(91,69,232,.10);
-}
-#login .btn-primary{
-  min-height:48px;
-  border-radius:14px;
+  min-height:44px;
+  margin:0 0 0;
+  padding:0 14px;
   border:1px solid transparent;
-  padding:12px 16px;
+  border-radius:var(--radius-sm);
+  background:var(--surface-2);
+  color:var(--text);
+  outline:none;
+  transition:background .18s var(--ease),border-color .18s var(--ease),box-shadow .18s var(--ease);
+}
+input::placeholder{color:#aeaeb2}
+input:hover,select:hover{background:#ececf0}
+input:focus,select:focus{
+  background:#fff;
+  border-color:var(--accent);
+  box-shadow:0 0 0 4px var(--accent-soft);
+}
+#login .field input{margin:0}
+
+/* Buttons */
+.btn{
+  border:0;
+  border-radius:var(--radius-sm);
+  min-height:44px;
+  padding:0 16px;
   display:inline-flex;
   align-items:center;
   justify-content:center;
-  width:100%;
-  background:linear-gradient(135deg,#5b45e8,#7440ee);
+  gap:8px;
+  font-weight:590;
+  font-size:14px;
+  letter-spacing:-.01em;
+  background:var(--surface-2);
+  color:var(--text);
+  transition:background .18s var(--ease),transform .12s var(--ease),color .18s var(--ease),border-color .18s var(--ease);
+}
+.btn:hover:not(:disabled){background:#e8e8ed}
+.btn:active:not(:disabled){transform:scale(.985)}
+.btn:focus-visible{outline:none;box-shadow:0 0 0 4px var(--accent-soft)}
+.btn:disabled{opacity:.55;cursor:default;transform:none}
+.wide,.btn-block{width:100%}
+.primary,.btn-primary{
+  background:var(--accent);
   color:#fff;
-  font-size:13px;
-  font-weight:850;
-  cursor:pointer;
-  box-shadow:0 10px 24px rgba(91,69,232,.18);
 }
-#login .btn-primary:disabled{opacity:.65;cursor:wait}
-#login .alert-danger{
-  padding:10px 12px;
-  border-radius:12px;
-  font-size:11px;
-  line-height:1.45;
-  background:#fef3f2;
-  border:1px solid #fecdca;
-  color:#b42318;
+.primary:hover:not(:disabled),.btn-primary:hover:not(:disabled){background:var(--accent-hover)}
+.primary:active:not(:disabled),.btn-primary:active:not(:disabled){background:var(--accent-press)}
+.light{
+  background:#fff;
+  color:var(--text);
+  border:1px solid var(--line-strong);
 }
-#login .spinner{
-  width:14px;
-  height:14px;
-  margin:0 8px 0 0;
-  border:2px solid rgba(255,255,255,.45);
-  border-top-color:#fff;
-  border-radius:50%;
-  display:inline-block;
-  animation:loginSpin 0.7s linear infinite;
-  vertical-align:-2px;
+.light:hover:not(:disabled){background:var(--surface-2)}
+.danger{
+  background:#fff;
+  color:var(--bad);
+  border:1px solid var(--bad-line);
 }
-@keyframes loginSpin{to{transform:rotate(360deg)}}
+.danger:hover:not(:disabled){background:var(--bad-bg)}
 
-/* Connected Client Space — premium UI pass (UI only) */
-#app .topbar{
-  padding:14px 13px 12px;
+.alert{
+  padding:12px 14px;
+  border-radius:var(--radius-sm);
+  font-size:12px;
+  line-height:1.45;
+  text-align:left;
 }
-#app .brand{
-  gap:10px;
+.alert.info,.alert-info{background:var(--info-bg);border:1px solid var(--info-line);color:var(--info)}
+.alert.bad,.alert-danger{background:var(--bad-bg);border:1px solid var(--bad-line);color:var(--bad)}
+.alert.good{background:var(--good-bg);border:1px solid rgba(29,127,55,.16);color:var(--good)}
+.small{font-size:12px;color:var(--faint);line-height:1.45}
+
+/* Signed-in */
+#app{width:100%;padding:0 0 72px}
+.topbar{
+  display:flex;align-items:center;justify-content:space-between;
+  padding:18px 20px 6px;
 }
-#app .mini-logo{
-  width:40px;
-  height:40px;
-  border-radius:12px;
-  font-size:20px;
-  box-shadow:0 10px 24px rgba(79,70,229,.18);
+.brand{display:flex;align-items:center;gap:10px;min-width:0}
+.brand strong{display:block;font-size:15px;font-weight:650;letter-spacing:-.02em;line-height:1.2}
+.brand small{display:block;margin-top:1px;font-size:12px;color:var(--faint);font-weight:450}
+
+.card{
+  margin:10px 16px;
+  background:var(--surface);
+  border:1px solid var(--line);
+  border-radius:var(--radius);
+  box-shadow:var(--shadow);
 }
-#app .brand strong{
-  font-size:16px;
-  letter-spacing:-.02em;
+.status-card{padding:16px 16px 15px}
+.status-line{display:flex;align-items:center;justify-content:space-between;gap:12px}
+.card-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;padding:16px 16px 0}
+.card-body{padding:0 16px 16px}
+.status-card .eyebrow,.card-head .eyebrow,.card-body>.eyebrow{margin-top:0}
+.card h2{
+  margin:2px 0 0;
+  font-size:17px;
+  font-weight:650;
+  letter-spacing:-.022em;
+  line-height:1.25;
 }
-#app .brand small{
-  font-size:10px;
+.account-email{
+  display:block;
   margin-top:2px;
+  max-width:230px;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  font-size:12px;color:var(--faint);font-weight:450;
 }
-#app .card{
-  margin:9px 9px;
-  border-radius:18px;
-  box-shadow:0 8px 24px rgba(15,23,42,.045);
+.badge{
+  display:inline-flex;align-items:center;gap:6px;
+  flex:0 0 auto;
+  padding:5px 10px;
+  border-radius:999px;
+  font-size:12px;
+  font-weight:590;
+  letter-spacing:-.01em;
 }
-#app .status-card{
-  padding:16px 15px;
+.badge.good{background:var(--good-bg);color:var(--good)}
+.badge.warn{background:var(--warn-bg);color:var(--warn)}
+.badge.bad{background:var(--bad-bg);color:var(--bad)}
+.dot{width:6px;height:6px;border-radius:50%;background:currentColor}
+
+.kv{
+  display:flex;justify-content:space-between;align-items:center;gap:12px;
+  padding:11px 0;
+  border-bottom:1px solid rgba(0,0,0,.05);
+  font-size:13px;
 }
-#app .status-line{
-  align-items:center;
+.kv:last-of-type{border-bottom:0}
+.kv span{color:var(--muted)}
+.kv strong{
+  font-weight:590;
+  text-align:right;
+  max-width:210px;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
 }
-#app .status-card .eyebrow{
-  font-size:9px;
-  letter-spacing:.11em;
-}
-#app .status-card h2{
-  font-size:19px;
-  margin-top:6px;
-  letter-spacing:-.02em;
-}
-#app .status-card .badge{
-  padding:7px 10px;
-  font-size:9px;
-}
-#app .status-card .dot,
-#app .proxyCard .dot{
-  width:7px;
-  height:7px;
-}
-#app .action-card .card-body{
-  padding:13px;
-}
-#app #freshSync{
+#proxyCard .card-body .alert{margin-top:8px}
+
+.action-card .card-body{padding:12px}
+#freshSync{
   min-height:48px;
   border-radius:14px;
   font-size:15px;
-  font-weight:900;
-  box-shadow:0 10px 24px rgba(79,70,229,.16);
+  font-weight:600;
+  letter-spacing:-.015em;
 }
-#app #syncInfo{
-  font-size:10px;
-  margin-top:9px;
-}
-#app .proxyCard .card-head{
-  padding:15px 15px 9px;
-}
-#app .proxyCard .card-body{
-  padding:0 15px 15px;
-}
-#app .proxyCard .card-head h2{
-  font-size:18px;
-  margin-top:5px;
-  letter-spacing:-.02em;
-}
-#app .proxyCard .badge{
-  padding:7px 10px;
-  font-size:9px;
-}
-#app .proxyCard .kv{
-  padding:9px 0;
-  font-size:11px;
-}
-#app .proxyCard .kv strong{
-  max-width:245px;
-  font-size:11px;
-}
-#app .proxy-endpoint-row{
-  display:none;
-}
-#app .proxyCard .alert{
-  margin-top:9px;
-  border-radius:12px;
-  padding:10px 11px;
-  font-size:10px;
-}
-#app .sites-list{
-  margin-top:10px;
-  gap:7px;
-}
-#app .site-pill{
-  padding:10px 11px;
-  border-radius:13px;
-  background:#fbfcfe;
-  font-size:11px;
-}
-#app .signout-card .card-body{
-  padding:13px;
-}
-#app #logout{
-  min-height:46px;
-  border-radius:14px;
-  background:#fff;
-  border:1px solid #f5b8b5;
-  color:#b42318;
-  font-size:13px;
-  font-weight:850;
-  box-shadow:none;
-}
-#app #logout:hover{background:#fff7f6}
-#app .ui-hook{display:none!important}
-
-
-/* Login action state polish */
-#app #freshSync .spinner{
-  width:16px;
-  height:16px;
-  flex:0 0 16px;
-  margin:0 1px 0 0;
-  border:2px solid rgba(255,255,255,.42);
-  border-top-color:#fff;
-  border-right-color:rgba(255,255,255,.85);
-  border-radius:50%;
-  display:inline-block;
-  animation:loginButtonSpin .7s linear infinite;
-  will-change:transform;
-}
-@keyframes loginButtonSpin{to{transform:rotate(360deg)}}
-#app #freshSync.login-success{
-  background:linear-gradient(135deg,#16a34a,#22c55e);
-  box-shadow:0 10px 24px rgba(22,163,74,.18);
+#freshSync.login-success,#freshSync.login-success:hover,#freshSync.login-success:disabled{
+  background:var(--good);
+  color:#fff;
+  opacity:1;
   cursor:default;
+  transform:none;
 }
-#app #freshSync.login-success:hover{filter:none;transform:none;box-shadow:0 10px 24px rgba(22,163,74,.18)}
-#app #freshSync.login-success:disabled{opacity:1;cursor:default}
-.login-success-check{
-  display:inline-grid;
-  place-items:center;
-  width:18px;
-  height:18px;
-  margin-right:1px;
-  border-radius:50%;
-  background:rgba(255,255,255,.20);
-  font-size:11px;
-  line-height:1;
-}
-
-
-/* Steve Jobs spacing refinement — visual only */
-#app .card{
-  margin:10px 10px;
-  border-radius:18px;
-}
-#app .status-card{
-  padding:18px 17px;
-}
-#app .status-card h2{
-  font-size:18px;
-}
-#app .action-card .card-body{
-  padding:15px 17px;
-}
-#app .proxyCard .card-head{
-  padding:16px 17px 9px;
-}
-#app .proxyCard .card-body{
-  padding:0 17px 17px;
-}
-#app .proxyCard .card-head h2{
-  font-size:17px;
-}
-#app .proxyCard .kv{
-  padding:10px 0;
-  font-size:10.5px;
-}
-#app .proxyCard .kv strong{
-  font-size:10.5px;
-}
-#app .proxyCard .alert{
-  margin-top:10px;
-  padding:10px 12px;
-}
-#app > .card:has(#sitesList){
-  padding:17px;
-}
-#app .sites-list{
-  margin-top:12px;
-  gap:8px;
-}
-#app .site-pill{
-  padding:11px 12px;
-  border-radius:13px;
-  font-size:10.5px;
-}
-#app .signout-card .card-body{
-  padding:15px 17px;
-}
-#app #logout{
-  min-height:45px;
-  font-size:12.5px;
-}
-
-/* No customer-facing sync status text; JS hook is intentionally preserved. */
-#app #syncInfo{display:none!important}
-
-/* Login success state: typographic check, not an emoji. */
 .login-success-check{
   position:relative;
-  width:16px;
-  height:16px;
-  flex:0 0 16px;
-  margin-left:2px;
+  width:16px;height:16px;flex:0 0 16px;
   border-radius:50%;
-  background:rgba(255,255,255,.18);
+  background:rgba(255,255,255,.22);
 }
-.login-success-check::before,
-.login-success-check::after{
-  content:"";
-  position:absolute;
-  background:#fff;
-  border-radius:2px;
-  transform-origin:left center;
+.login-success-check::before,.login-success-check::after{
+  content:"";position:absolute;background:#fff;border-radius:2px;transform-origin:left center;
 }
-.login-success-check::before{
-  width:5px;
-  height:2px;
-  left:4px;
-  top:8px;
-  transform:rotate(45deg);
-}
-.login-success-check::after{
-  width:8px;
-  height:2px;
-  left:7px;
-  top:9px;
-  transform:rotate(-50deg);
-}
+.login-success-check::before{width:5px;height:1.5px;left:3px;top:8px;transform:rotate(45deg)}
+.login-success-check::after{width:8px;height:1.5px;left:6px;top:9px;transform:rotate(-50deg)}
 .login-success-label{display:inline-block}
 
-/* Login page icon size refinement — UI only. */
-#login .brand-mark, .login-card .brand-mark{
-  width:58px;
-  height:58px;
-  border-radius:18px;
-  font-size:28px;
-}
-#login .brand-mark::after{
-  right:-3px;
-  bottom:-3px;
-}
-
-/* Steve Jobs compact spacing pass — same 410px popup, smaller controls/text, more breathing room. */
-body{font-size:11.5px}
-.screen{padding:22px}
-#login.screen{padding:16px}
-#login .state-card{padding:26px}
-#login .brand-mark, .login-card .brand-mark{width:48px;height:48px;border-radius:15px;font-size:23px}
-#login .eyebrow{margin-top:14px;font-size:8.5px}
-#login .state-card h1{font-size:20px;margin:9px 0 5px}
-#login .state-card p{font-size:11px}
-#login .form-stack{gap:10px;margin-top:19px}
-#login .field label{font-size:10px;margin-bottom:5px}
-#login .field input{min-height:40px;border-radius:11px;padding:9px 11px;font-size:11.5px}
-#login .btn-primary{min-height:40px;border-radius:11px;padding:9px 12px;font-size:11.5px}
-#login .alert-danger{padding:8px 10px;font-size:10px}
-
-#app .topbar{padding:16px 17px 14px}
-#app .brand{gap:9px}
-#app .mini-logo{width:38px;height:38px;border-radius:11px;font-size:19px}
-#app .brand strong{font-size:15px}
-#app .brand small{font-size:9px}
-#app .card{margin:10px 11px;border-radius:18px}
-#app .status-card{padding:19px 18px}
-#app .status-card .eyebrow{font-size:8.5px}
-#app .status-card h2{font-size:17px;margin-top:5px}
-#app .status-card .badge{padding:6px 9px;font-size:8.5px}
-#app .status-card .dot,#app .proxyCard .dot{width:6px;height:6px}
-#app .action-card .card-body{padding:16px 18px}
-#app #freshSync{min-height:44px;border-radius:13px;font-size:14px}
-#app .proxyCard .card-head{padding:17px 18px 10px}
-#app .proxyCard .card-body{padding:0 18px 18px}
-#app .proxyCard .card-head h2{font-size:16px}
-#app .proxyCard .badge{padding:6px 9px;font-size:8.5px}
-#app .proxyCard .kv{padding:10px 0;font-size:9.8px}
-#app .proxyCard .kv strong{font-size:9.8px}
-#app .proxyCard .alert{margin-top:10px;padding:10px 11px;font-size:9.5px}
-#app > .card:has(#sitesList){padding:18px}
-#app .sites-list{margin-top:12px;gap:8px}
-#app .site-pill{padding:12px 13px;border-radius:13px;font-size:9.8px}
-#app .signout-card .card-body{padding:16px 18px}
-#app #logout{min-height:43px;border-radius:13px;font-size:11.5px}
-#app .footer{font-size:7.5px;padding:8px 10px 12px}
-
-/* Keep the popup canvas exactly 410px wide while giving the inner content a little more air. */
-#app{padding:0 4px 0}
-
-
-/* Chrome recovery helper on the login screen. */
 .chrome-help{
-  margin-top:14px;
-  padding:12px 13px;
-  border:1px solid #e8eaf2;
-  border-radius:13px;
-  background:linear-gradient(180deg,#fafbff 0%,#f7f8fc 100%);
+  margin:10px 16px;
+  padding:14px 14px 12px;
+  border-radius:var(--radius);
+  background:rgba(255,255,255,.55);
+  border:1px solid var(--line);
   text-align:center;
 }
-.chrome-help-title{
-  color:#344054;
-  font-size:10px;
-  font-weight:900;
-}
-.chrome-help-text{
-  margin-top:3px;
-  color:#667085;
-  font-size:9px;
-  line-height:1.45;
-}
+.chrome-help-title{font-size:13px;font-weight:600;letter-spacing:-.01em;color:var(--text)}
+.chrome-help-text{margin-top:2px;font-size:12px;color:var(--muted);line-height:1.4}
 .chrome-fix-btn{
-  margin-top:8px;
-  min-height:34px;
-  padding:7px 14px;
-  border:1px solid #ddd6fe;
-  border-radius:10px;
-  background:#fff;
-  color:#6d4aff;
-  font-size:9.5px;
-  font-weight:900;
+  margin-top:10px;
+  min-height:32px;
+  padding:0 12px;
+  border-radius:999px;
+  background:transparent;
+  color:var(--accent);
+  font-size:13px;
+  font-weight:590;
 }
-.chrome-fix-btn:hover{background:#f5f3ff}
+.chrome-fix-btn:hover:not(:disabled){background:var(--accent-soft)}
 
-#app .status-card .account-email{margin-top:4px;font-size:9px;color:#98a2b3;font-weight:500;}
+.sites-list{margin-top:10px;display:flex;flex-direction:column;gap:6px}
+.site-pill{
+  display:flex;justify-content:space-between;gap:10px;
+  padding:10px 12px;
+  border-radius:12px;
+  background:var(--surface-2);
+  font-size:13px;
+  transition:background .18s var(--ease);
+}
+.site-pill:hover{background:#ececf0}
+.site-pill span{color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.site-pill span:first-child{color:var(--text);font-weight:590}
 
-/* Premium LogIn Website action — subtle hover, no layout shift. */
-.action-card{
-  padding:5px;
+.signout-card .card-body{padding:12px}
+#logout{min-height:44px;font-size:14px}
+.footer{
+  text-align:center;
+  color:var(--faint);
+  font-size:11px;
+  padding:6px 16px 18px;
 }
-.action-card .card-body{
-  padding:5px 8px 8px;
-}
-#freshSync{
-  transition:transform .16s ease, box-shadow .16s ease, filter .16s ease;
-  will-change:transform;
-}
-#freshSync:hover:not(:disabled){
-  transform:translateY(-1px);
-  filter:saturate(1.04);
-  box-shadow:0 12px 26px rgba(79,70,229,.22);
-}
-#freshSync:active:not(:disabled){
-  transform:translateY(0);
-  box-shadow:0 7px 16px rgba(79,70,229,.18);
-}
+.footer b{font-weight:600}
 
-/* Final compact polish: hide the popup scrollbar, slightly reduce client UI scale, and restore a little login breathing room. */
-html::-webkit-scrollbar, body::-webkit-scrollbar{width:0!important;height:0!important;display:none!important}
-html,body{scrollbar-width:none!important;-ms-overflow-style:none!important}
-#app .topbar{padding:13px 15px 12px}
-#app .card{margin:8px 10px;border-radius:17px}
-#app .status-card{padding:16px 16px}
-#app .status-card h2{font-size:16px;margin-top:4px}
-#app .status-card .badge{padding:5px 8px;font-size:8px}
-#app .action-card .card-body{padding:13px 15px 15px}
-#app #freshSync{min-height:40px;border-radius:12px;font-size:13px}
-#app .proxyCard .card-head{padding:14px 16px 8px}
-#app .proxyCard .card-body{padding:0 16px 15px}
-#app .proxyCard .card-head h2{font-size:15px}
-#app .proxyCard .kv{padding:8px 0;font-size:9.5px}
-#app .proxyCard .kv strong{font-size:9.5px}
-#app > .card:has(#sitesList){padding:15px}
-#app .sites-list{margin-top:10px;gap:7px}
-#app .site-pill{padding:10px 11px;border-radius:12px;font-size:9.5px}
-#app .signout-card .card-body{padding:14px 16px}
-#app #logout{min-height:40px;border-radius:12px;font-size:11px}
-
-/* Give the login screen just a little more top breathing room, without the old large blank area. */
-#login.screen{min-height:540px!important;display:grid!important;place-items:center!important;padding:20px!important}
-#login .state-card{padding:24px}
-
-/* Minimal startup loading state */
-.startup-loader{
-  width:32px;
-  height:32px;
+.toast{
+  position:fixed;left:16px;right:16px;bottom:68px;
+  padding:12px 14px;border-radius:14px;
+  color:#fff;background:rgba(29,29,31,.92);
+  backdrop-filter:blur(16px);
+  box-shadow:0 12px 32px rgba(0,0,0,.18);
+  font-size:13px;z-index:80;
+}
+.spinner{
+  width:14px;height:14px;flex:0 0 14px;
+  border:2px solid rgba(255,255,255,.35);
+  border-top-color:#fff;
   border-radius:50%;
-  border:3px solid rgba(91,69,232,.14);
-  border-top-color:#5b45e8;
-  border-right-color:#7440ee;
-  animation:startupSpin .65s cubic-bezier(.4,0,.2,1) infinite;
-  box-shadow:0 0 18px rgba(91,69,232,.10);
+  display:inline-block;
+  animation:spin .7s linear infinite;
+}
+.purple{color:var(--accent)}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+.startup-loader{
+  width:28px;height:28px;border-radius:50%;
+  border:2.5px solid var(--accent-soft);
+  border-top-color:var(--accent);
+  animation:spin .7s linear infinite;
   position:relative;
 }
-.startup-loader::after{
-  content:"";
-  position:absolute;
-  inset:6px;
-  border-radius:50%;
-  border:1px solid rgba(91,69,232,.08);
-}
 .startup-text{
-  position:absolute!important;
-  width:1px!important;
-  height:1px!important;
-  padding:0!important;
-  margin:-1px!important;
-  overflow:hidden!important;
-  clip:rect(0,0,0,0)!important;
-  white-space:nowrap!important;
-  border:0!important;
-}
-@keyframes startupSpin{to{transform:rotate(360deg)}}
-
-/* FINAL SHARED SCROLLBAR: identical behavior across Admin + Client. */
-html, body{
-  overflow-x:hidden!important;
-  overflow-y:auto!important;
-  scrollbar-gutter:stable!important;
-  scrollbar-width:thin!important;
-  scrollbar-color:rgba(23,32,51,.12) transparent!important;
-}
-html::-webkit-scrollbar, body::-webkit-scrollbar{
-  width:9px!important;
-  height:9px!important;
-}
-html::-webkit-scrollbar-track, body::-webkit-scrollbar-track{
-  background:transparent!important;
-}
-html::-webkit-scrollbar-thumb, body::-webkit-scrollbar-thumb{
-  background:rgba(23,32,51,.12)!important;
-  border:2px solid transparent!important;
-  border-radius:999px!important;
-  background-clip:padding-box!important;
-  min-height:28px!important;
-}
-html:hover::-webkit-scrollbar-thumb, body:hover::-webkit-scrollbar-thumb,
-html.scrollbar-active::-webkit-scrollbar-thumb, body.scrollbar-active::-webkit-scrollbar-thumb{
-  background:rgba(23,32,51,.46)!important;
-}
-html::-webkit-scrollbar-button, body::-webkit-scrollbar-button{
-  display:none!important;
-  width:0!important;
-  height:0!important;
-}
-html.scrollbar-active, body.scrollbar-active{
-  scrollbar-color:rgba(23,32,51,.46) transparent!important;
+  position:absolute!important;width:1px!important;height:1px!important;
+  padding:0!important;margin:-1px!important;overflow:hidden!important;
+  clip:rect(0,0,0,0)!important;white-space:nowrap!important;border:0!important;
 }
 
-
-/* Final visual alignment: centered content, no artificial right gutter. */
-#login.screen:not(.hidden){
-  padding-top:27px!important;
-  padding-left:0!important;
-  padding-right:0!important;
-}
-#login .state-card{
-  margin-left:auto!important;
-  margin-right:auto!important;
-}
-#app{
-  width:100%!important;
-  max-width:none!important;
-  padding-left:0!important;
-  padding-right:0!important;
-}
-#app .topbar{
-  width:100%!important;
-}
-#app > .card,
-#app > .chrome-help{
-  width:calc(100% - 20px)!important;
-  margin-left:auto!important;
-  margin-right:auto!important;
-}
-
-/* Final alignment: let the translucent scrollbar overlay the edge; center visible content in the full popup. */
-html, body { scrollbar-gutter:auto!important; }
-#app { width:100%!important; max-width:none!important; padding:0!important; }
-#app .topbar { width:calc(100% + 9px)!important; margin-right:-9px!important; }
-#app > .card, #app > .chrome-help {
-  width:calc(100% - 9px)!important;
-  margin-left:9px!important;
-  margin-right:0!important;
-}
-#login .state-card { transform:translateX(4.5px); }
-
-/* Targeted final repair: keep login/app state visibility reliable and add 20% more top breathing room. */
-#login.screen.hidden{display:none!important}
-#app.hidden{display:none!important}
-#login.screen:not(.hidden){
-  display:grid!important;
-  place-items:start center!important;
-  min-height:540px!important;
-  padding:32px 0 20px!important;
-}
-
-/* Requested spacing only: +20% top breathing room for main LogIn login and extension page. */
-#login.screen:not(.hidden){padding-top:40px!important;}
-#app .topbar{padding-top:16.8px!important;}
-
-/* Final login-state tuning: no visible scrollbar on the compact sign-in view,
-   while keeping the page scrollable if an error message ever makes it taller. */
-html:has(#login.screen:not(.hidden)),
-body:has(#login.screen:not(.hidden)){
-  overflow-y:auto!important;
-  scrollbar-width:none!important;
-  -ms-overflow-style:none!important;
-}
-html:has(#login.screen:not(.hidden))::-webkit-scrollbar,
-body:has(#login.screen:not(.hidden))::-webkit-scrollbar{
-  width:0!important;
-  height:0!important;
-  display:none!important;
-}
-/* Main LogIn: a little more deliberate breathing room above the sign-in card. */
-#login.screen:not(.hidden){
-  min-height:540px!important;
-  display:grid!important;
-  place-items:start center!important;
-  padding:80px 0 20px!important;
+@media (prefers-reduced-motion:reduce){
+  .btn,.site-pill,input,select{transition:none}
+  .login-card .brand-mark::after{animation:none}
 }

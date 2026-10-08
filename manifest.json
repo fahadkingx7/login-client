@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "LogIn",
-  "version": "10.6.2.7",
-  "description": "Share LogIn easily",
+  "version": "6.1.33",
+  "description": "LogIn, share simply",
   "minimum_chrome_version": "120",
   "permissions": [
     "cookies",
@@ -45,7 +45,11 @@
         "blocked.html",
         "unauthorized-website.html",
         "welcome.html",
-        "proxy-setup.html"
+        "proxy-setup.html",
+        "suspended.html",
+        "signed-out.html",
+        "status-pages.css",
+        "logo-login-app.png"
       ],
       "matches": [
         "<all_urls>"

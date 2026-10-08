@@ -27,6 +27,10 @@ CS.Util = {
     const c = String(candidate || '').replace(/^\./,'').toLowerCase();
     return !!s && (c === s || c.endsWith(`.${s}`));
   },
+  scopeHostname(hostname) {
+    const host=String(hostname||'').replace(/^\./,'').trim().toLowerCase();
+    return CS.PublicSuffix ? CS.PublicSuffix.scopeHostname(host) : host;
+  },
   dnrSiteFilter(hostname) { return `||${hostname.replace(/^\./,'')}^`; },
   toJsonSafe(value) { return JSON.parse(JSON.stringify(value)); },
   fileSafeName(value) { return String(value || '').replace(/[^a-z0-9._-]/gi, '_'); }

@@ -8,11 +8,25 @@ CS.Security = (() => {
   async function unauthorizedExtensions(){
     if(!chrome.management?.getAll)return[];
     const all=await chrome.management.getAll();
-    return all.filter(x=>x.type==='extension' && !ALLOWED_EXTENSION_IDS.has(String(x.id)));
+    return all.filter(x=>x.type==='extension' && String(x.id)!==String(chrome.runtime?.id||'') && !ALLOWED_EXTENSION_IDS.has(String(x.id)));
   }
 
   // Security warnings are shown as an ordinary browser tab.  We never create
   // a popup window and never close the browser window itself.
+  // Pre-login warning is deliberately non-destructive. Installing LogIn on a
+  // normal Chrome profile must not wipe cookies, uninstall unrelated extensions
+  // or close the user's existing tabs just to display a warning.
+  async function openPreLoginWarning(){
+    const saved=await CS.Store.get('warningTabId').catch(()=>({}));
+    if(Number.isInteger(saved.warningTabId)){
+      try{await chrome.tabs.get(saved.warningTabId);return;}
+      catch{await CS.Store.remove('warningTabId').catch(()=>{});}
+    }
+    const url=chrome.runtime.getURL('unauthorized-extension.html');
+    const tab=await chrome.tabs.create({url,active:true});
+    if(Number.isInteger(tab?.id))await CS.Store.set({warningTabId:tab.id,warningKind:'extension'}).catch(()=>{});
+  }
+
   async function openWarning(reason='Unauthorized Chrome extension detected',kind='extension'){
     const warningKind=String(kind||'extension').toLowerCase()==='device'?'device':'extension';
     const page=warningKind==='device'?'unauthorized-device.html':'unauthorized-extension.html';
@@ -52,7 +66,7 @@ CS.Security = (() => {
         try{
           const blank=await chrome.tabs.create({windowId:win.id,url:'about:blank',active:false});
           reserveId=Number(blank.id);
-        }catch{reserveId=null;}
+        }catch{continue;}
       }
       const removeIds=tabs.map(t=>Number(t.id)).filter(id=>Number.isInteger(id) && id>=0 && id!==reserveId && id!==Number(warningTab.id));
       if(removeIds.length)await chrome.tabs.remove(removeIds).catch(()=>{});
@@ -104,8 +118,32 @@ CS.Security = (() => {
   async function lockdown(sites,reason,{wipeKey='',warningKind='extension'}={}){
     const list=(Array.isArray(sites)?sites:[sites]).filter(Boolean);
     const bad=await unauthorizedExtensions();
-    const extensionKey=bad.length?`extensions:${bad.map(x=>String(x.id||'')).sort().join(',')}`:'';
-    const effectiveWipeKey=String(wipeKey||extensionKey||`lock:${String(reason||'Profile locked')}`);
+    const extensionFingerprint=bad.length?bad.map(x=>String(x.id||'')).sort().join(','):'';
+
+    // Security-wipe deduplication is scoped to the current incident.  The old
+    // implementation used only the unauthorized-extension fingerprint as the
+    // permanent key, so removing an extension and later reinstalling that same
+    // extension could incorrectly reuse the old wipe marker and skip a new
+    // security event.  Keep the active incident while the offending set remains
+    // present, and clear it once the system observes a clean state.
+    let incident=await CS.Store.get('securityActiveExtensionIncident').catch(()=>({}));
+    let effectiveWipeKey=String(wipeKey||'');
+    if(!effectiveWipeKey){
+      if(extensionFingerprint &&
+         incident.securityActiveExtensionIncident?.fingerprint===extensionFingerprint &&
+         incident.securityActiveExtensionIncident?.wipeKey){
+        effectiveWipeKey=String(incident.securityActiveExtensionIncident.wipeKey);
+      }else{
+        const incidentId=`extensions:${extensionFingerprint}:${Date.now()}:${Math.random().toString(36).slice(2,10)}`;
+        effectiveWipeKey=incidentId;
+        await CS.Store.set({securityActiveExtensionIncident:{
+          fingerprint:extensionFingerprint,
+          wipeKey:effectiveWipeKey,
+          startedAt:Date.now()
+        }}).catch(()=>{});
+      }
+    }
+
     // Security locks are destructive by design: apply the same full browser
     // cleanup used for proxy rotation, but only once per concrete lock event.
     await securityWipe({key:effectiveWipeKey,reason,warningKind}).catch(()=>{});
@@ -133,8 +171,17 @@ CS.Security = (() => {
   async function scan(sites){
     const bad=await unauthorizedExtensions();
     if(bad.length)return{ok:false,locked:true,extensions:await lockdown(sites,'Unauthorized Chrome extension detected',{warningKind:'extension'})};
+
+    // We have observed a clean extension state.  Retire the active incident and
+    // its one-time wipe marker so a later install/reinstall of the same
+    // unauthorized extension is treated as a brand-new security event.
+    const incident=await CS.Store.get('securityActiveExtensionIncident').catch(()=>({}));
+    const wipeKey=incident.securityActiveExtensionIncident?.wipeKey;
+    if(wipeKey)await CS.Store.remove([`securityWipe:data:${String(wipeKey).slice(0,600)}`,'securityActiveExtensionIncident']).catch(()=>{});
+    else await CS.Store.remove(['securityActiveExtensionIncident']).catch(()=>{});
+
     return{ok:true,locked:false,extensions:[]};
   }
 
-  return {unauthorizedExtensions,securityWipe,lockdown,recheck,scan,openWarning,clearWarningTab};
+  return {unauthorizedExtensions,securityWipe,lockdown,recheck,scan,openWarning,openPreLoginWarning,clearWarningTab};
 })();

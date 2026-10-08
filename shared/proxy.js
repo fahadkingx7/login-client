@@ -1,6 +1,6 @@
 globalThis.CS = globalThis.CS || {};
 CS.Proxy = (() => {
-  let authInstalled=false, errorInstalled=false, testPromise=null;
+  let authInstalled=false, errorInstalled=false, testPromise=null, testKey='';
   const authAttempts=new Map();
   let lastProxyError='';
 
@@ -17,6 +17,15 @@ CS.Proxy = (() => {
     return {mode:'fixed_servers',scheme,host,port,username:String(raw.username||''),password:String(raw.password||''),expectedIp:String(raw.expectedIp||'').trim()};
   }
 
+  const BYPASS_LIST=['<-loopback>','thdxsonrjazeoadhidbx.supabase.co'];
+  function matchesEffective(result,p){
+    const value=result?.value||{}, proxy=value.rules?.singleProxy||{};
+    const bypass=value.rules?.bypassList||[];
+    return value.mode==='fixed_servers' && String(proxy.scheme||'').toLowerCase()===p.scheme &&
+      String(proxy.host||'').toLowerCase()===p.host.toLowerCase() && Number(proxy.port)===p.port &&
+      bypass.length===BYPASS_LIST.length && BYPASS_LIST.every(host=>bypass.includes(host));
+  }
+
   async function apply(raw){
     const p=normalize(raw);
     if(p.mode==='unconfigured') throw new Error('Proxy is not configured. Enter a working proxy before using managed access.');
@@ -24,15 +33,16 @@ CS.Proxy = (() => {
     if(current?.levelOfControl && !['controlled_by_this_extension','controllable_by_this_extension'].includes(current.levelOfControl)){
       throw new Error(`Chrome proxy settings are controlled by ${current.levelOfControl}.`);
     }
+    if(matchesEffective(current,p)){lastProxyError='';return p;}
     await chrome.proxy.settings.set({
       value:{
         mode:'fixed_servers',
-        rules:{singleProxy:{scheme:p.scheme,host:p.host,port:p.port},bypassList:['<local>','<-loopback>','thdxsonrjazeoadhidbx.supabase.co']}
+        rules:{singleProxy:{scheme:p.scheme,host:p.host,port:p.port},bypassList:BYPASS_LIST}
       },
       scope:'regular'
     });
     const after=await effective().catch(()=>null);
-    if(after?.value?.mode!=='fixed_servers' || after?.value?.rules?.singleProxy?.host!==p.host || Number(after?.value?.rules?.singleProxy?.port)!==p.port){
+    if(!matchesEffective(after,p)){
       throw new Error('Chrome did not accept the saved proxy configuration.');
     }
     lastProxyError='';
@@ -44,6 +54,28 @@ CS.Proxy = (() => {
     await CS.Store.remove(['activeProxyCredentials']).catch(()=>{});
   }
   async function effective(){return new Promise((resolve,reject)=>chrome.proxy.settings.get({incognito:false},x=>chrome.runtime.lastError?reject(chrome.runtime.lastError):resolve(x)));}
+
+  function ipCheckUrls(){
+    const urls=Array.isArray(CS.CONFIG.ipCheckUrls)?CS.CONFIG.ipCheckUrls.filter(Boolean):[];
+    return [...new Set(urls)];
+  }
+
+  async function readPublicIp(url, timeoutMs){
+    const controller=new AbortController();
+    const timer=setTimeout(()=>controller.abort(),timeoutMs);
+    try{
+      const response=await fetch(url,{cache:'no-store',redirect:'follow',headers:{Accept:'application/json,text/plain'},signal:controller.signal});
+      const body=await response.text();
+      if(!response.ok) throw new Error(`Proxy health endpoint returned HTTP ${response.status}.`);
+      let ip='';
+      try{ip=String(JSON.parse(body)?.ip||'').trim();}
+      catch{const m=String(body).match(/\b(?:\d{1,3}\.){3}\d{1,3}\b/);ip=m?m[0]:'';}
+      if(!ip) throw new Error('The proxy returned no public IP.');
+      return ip;
+    }finally{
+      clearTimeout(timer);
+    }
+  }
 
   function friendlyProxyError(error){
     const e=String(error||'').trim();
@@ -60,29 +92,47 @@ CS.Proxy = (() => {
   async function test(raw, options={}){
     const p=normalize(raw);
     if(p.mode==='unconfigured') return {ok:false,ip:null,reason:'Proxy is not configured.'};
-    if(testPromise) return testPromise;
+    const key=JSON.stringify([p.scheme,p.host,p.port,p.username,p.password,p.expectedIp]);
+    if(testPromise){
+      if(testKey===key)return testPromise;
+      await testPromise;
+      return test(raw,options);
+    }
+    testKey=key;
     testPromise=(async()=>{
       try{
         const eff=await effective();
         if(eff?.levelOfControl && !['controlled_by_this_extension','controllable_by_this_extension'].includes(eff.levelOfControl)){
           return {ok:false,ip:null,reason:`Chrome proxy settings are controlled by ${eff.levelOfControl}.`};
         }
+        if(!matchesEffective(eff,p))return {ok:false,ip:null,reason:'The configured proxy is not currently active in Chrome.'};
         const timeoutMs=Math.max(1000,Math.min(20000,Number(options?.timeoutMs)||10000));
-        const controller=new AbortController();
-        const timer=setTimeout(()=>controller.abort(),timeoutMs);
-        try{
-          // Service-worker fetch goes through the active Chrome proxy without
-          // opening, activating, or repeatedly creating a browser tab.
-          const response=await fetch(CS.CONFIG.ipCheckUrl,{cache:'no-store',redirect:'follow',headers:{Accept:'application/json'},signal:controller.signal});
-          const body=await response.text();
-          if(!response.ok) throw new Error(`Proxy health endpoint returned HTTP ${response.status}.`);
-          let ip='';
-          try{ip=String(JSON.parse(body)?.ip||'').trim();}
-          catch{const m=String(body).match(/\b(?:\d{1,3}\.){3}\d{1,3}\b/);ip=m?m[0]:'';}
-          if(!ip) throw new Error('The proxy returned no public IP. Check host, port and authentication.');
-          if(p.expectedIp && ip!==p.expectedIp)return {ok:false,ip,reason:`Unexpected public IP: ${ip} (expected ${p.expectedIp}).`};
-          return {ok:true,ip,reason:'Proxy is working'};
-        } finally { clearTimeout(timer); }
+        const urls=ipCheckUrls();
+        if(!urls.length) throw new Error('No proxy IP health endpoints are configured.');
+
+        // Try providers sequentially. This keeps the normal case to one request
+        // while allowing recovery when a single provider is temporarily unavailable.
+        let lastFailure='';
+        let mismatchIp=null;
+        let mismatchReason='';
+        for(const url of urls){
+          try{
+            const ip=await readPublicIp(url,timeoutMs);
+            if(p.expectedIp && ip!==p.expectedIp){
+              mismatchIp=ip;
+              mismatchReason=`Unexpected public IP: ${ip} (expected ${p.expectedIp}).`;
+              continue;
+            }
+            if(!matchesEffective(await effective(),p))return {ok:false,ip:null,reason:'Proxy settings changed during verification. Please retry.'};
+            return {ok:true,ip,reason:'Proxy is working'};
+          }catch(e){
+            lastFailure=String(e?.message||e);
+          }
+        }
+        if(mismatchIp){
+          return {ok:false,ip:mismatchIp,reason:mismatchReason};
+        }
+        return {ok:false,ip:null,reason:friendlyProxyError(lastProxyError||lastFailure||'All proxy IP health endpoints failed.')};
       }catch(e){
         const base=String(e?.message||e);
         return {ok:false,ip:null,reason:friendlyProxyError(lastProxyError||base)};
@@ -101,6 +151,8 @@ CS.Proxy = (() => {
       const r=await CS.Store.get('activeProxyCredentials');
       const p=r.activeProxyCredentials;
       if(!p?.username)return cb({cancel:true});
+      const challenge=details.challenger||{};
+      if(!p.host || String(challenge.host||'').toLowerCase()!==String(p.host).toLowerCase() || Number(challenge.port)!==Number(p.port))return cb({cancel:true});
       return cb({authCredentials:{username:String(p.username),password:String(p.password||'')}});
     }catch{return cb({cancel:true});}})();return true;},{urls:['<all_urls>']},['asyncBlocking']);
   }
@@ -112,6 +164,6 @@ CS.Proxy = (() => {
       try{handler?.({...d,error:lastProxyError});}catch{}
     });
   }
-  async function setActiveCredentials(raw){const p=normalize(raw);await CS.Store.set({activeProxyCredentials:p.mode==='fixed_servers'?{username:p.username,password:p.password}:null});}
+  async function setActiveCredentials(raw){const p=normalize(raw);await CS.Store.set({activeProxyCredentials:p.mode==='fixed_servers'?{host:p.host,port:p.port,username:p.username,password:p.password}:null});}
   return {normalize,apply,clear,effective,test,installAuthListener,installProxyErrorListener,setActiveCredentials,friendlyProxyError};
 })();
